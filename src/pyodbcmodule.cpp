@@ -383,9 +383,9 @@ static PyObject* mod_datasources(PyObject* self)
     if (!result)
         return 0;
 
-    SQLCHAR szDSN[SQL_MAX_DSN_LENGTH];
+    SQLWCHAR szDSN[SQL_MAX_DSN_LENGTH];
     SWORD cbDSN;
-    SQLCHAR szDesc[200];
+    SQLWCHAR szDesc[200];
     SWORD cbDesc;
 
     SQLUSMALLINT nDirection = SQL_FETCH_FIRST;
@@ -395,19 +395,19 @@ static PyObject* mod_datasources(PyObject* self)
     for (;;)
     {
         Py_BEGIN_ALLOW_THREADS
-        ret = SQLDataSources(henv, nDirection, szDSN,  _countof(szDSN),  &cbDSN, szDesc, _countof(szDesc), &cbDesc);
+        ret = SQLDataSourcesW(henv, nDirection, szDSN,  _countof(szDSN),  &cbDSN, szDesc, _countof(szDesc), &cbDesc);
         Py_END_ALLOW_THREADS
         if (!SQL_SUCCEEDED(ret))
             break;
-
-        PyDict_SetItemString(result, (const char*)szDSN, PyString_FromString((const char*)szDesc));
+        
+        PyDict_SetItem(result, PyUnicode_FromUnicode((const wchar_t*)szDSN, cbDSN), PyUnicode_FromUnicode((const wchar_t*)szDesc, cbDesc));
         nDirection = SQL_FETCH_NEXT;
     }
 
     if (ret != SQL_NO_DATA)
     {
         Py_DECREF(result);
-        return RaiseErrorFromHandle("SQLDataSources", SQL_NULL_HANDLE, SQL_NULL_HANDLE);
+        return RaiseErrorFromHandle("SQLDataSourcesW", SQL_NULL_HANDLE, SQL_NULL_HANDLE);
     }
 
     return result;
