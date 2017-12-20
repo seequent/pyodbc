@@ -1290,7 +1290,7 @@ static bool GetIntVal(PyObject *obj, SQLULEN *pOut)
 {
     bool ret = false;
 #if PY_MAJOR_VERSION < 3
-    if (ret = PyInt_Check(obj))
+    if ((ret = PyInt_Check(obj)))
     {
         *pOut = (SQLULEN)PyInt_AS_LONG(obj);
     }
