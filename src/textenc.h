@@ -148,13 +148,17 @@ struct SQLWChar
     bool isValidOrNone()
     {
         // Returns true if this object is a valid string *or* None.
-        return isNone or (psz != 0);
+        return isNone || (psz != 0);
     }
 
     bool isValid()
     {
         return psz != 0;
     }
+
+private:
+    SQLWChar(const SQLWChar&) {}
+    void operator=(const SQLWChar&) {}
 };
 
 

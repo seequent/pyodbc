@@ -575,7 +575,10 @@ bool ProcessDAEParams(SQLRETURN &ret, Cursor *cur, bool freeObj)
         Py_END_ALLOW_THREADS
 
         if (ret != SQL_NEED_DATA && ret != SQL_NO_DATA && !SQL_SUCCEEDED(ret))
-            return RaiseErrorFromHandle(cur->cnxn, "SQLParamData", cur->cnxn->hdbc, cur->hstmt);
+        {
+            RaiseErrorFromHandle(cur->cnxn, "SQLParamData", cur->cnxn->hdbc, cur->hstmt);
+            return false;
+        }
 
         TRACE("SQLParamData() --> %d\n", ret);
         PyObject *obj = ((DAEParam*)pInfo)->cell;
@@ -596,7 +599,10 @@ bool ProcessDAEParams(SQLRETURN &ret, Cursor *cur, bool freeObj)
                     ret = SQLPutData(cur->hstmt, (SQLPOINTER)&p[offset], remaining);
                     Py_END_ALLOW_THREADS
                     if (!SQL_SUCCEEDED(ret))
-                        return RaiseErrorFromHandle(cur->cnxn, "SQLPutData", cur->cnxn->hdbc, cur->hstmt);
+                    {
+                        RaiseErrorFromHandle(cur->cnxn, "SQLPutData", cur->cnxn->hdbc, cur->hstmt);
+                        return false;
+                    }
                     offset += remaining;
                 }
                 while (offset < cb);
@@ -614,7 +620,10 @@ bool ProcessDAEParams(SQLRETURN &ret, Cursor *cur, bool freeObj)
                     ret = SQLPutData(cur->hstmt, (SQLPOINTER)&p[offset], remaining);
                     Py_END_ALLOW_THREADS
                     if (!SQL_SUCCEEDED(ret))
-                        return RaiseErrorFromHandle(cur->cnxn, "SQLPutData", cur->cnxn->hdbc, cur->hstmt);
+                    {
+                        RaiseErrorFromHandle(cur->cnxn, "SQLPutData", cur->cnxn->hdbc, cur->hstmt);
+                        return false;
+                    }
                     offset += remaining;
                 }
                 while (offset < cb);
@@ -633,7 +642,10 @@ bool ProcessDAEParams(SQLRETURN &ret, Cursor *cur, bool freeObj)
                     ret = SQLPutData(cur->hstmt, (SQLPOINTER)&p[offset], remaining);
                     Py_END_ALLOW_THREADS
                     if (!SQL_SUCCEEDED(ret))
-                        return RaiseErrorFromHandle(cur->cnxn, "SQLPutData", cur->cnxn->hdbc, cur->hstmt);
+                    {
+                        RaiseErrorFromHandle(cur->cnxn, "SQLPutData", cur->cnxn->hdbc, cur->hstmt);
+                        return false;
+                    }
                     offset += remaining;
                 }
                 while (offset < cb);
@@ -654,7 +666,10 @@ bool ProcessDAEParams(SQLRETURN &ret, Cursor *cur, bool freeObj)
                     ret = SQLPutData(cur->hstmt, pb, cb);
                     Py_END_ALLOW_THREADS
                     if (!SQL_SUCCEEDED(ret))
-                        return RaiseErrorFromHandle(cur->cnxn, "SQLPutData", cur->cnxn->hdbc, cur->hstmt);
+                    {
+                        RaiseErrorFromHandle(cur->cnxn, "SQLPutData", cur->cnxn->hdbc, cur->hstmt);
+                        return false;
+                    }
                 }
             }
 #endif
