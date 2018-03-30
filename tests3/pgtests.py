@@ -509,13 +509,58 @@ class PGTestCase(unittest.TestCase):
         result = str(row[:1])
         self.assertEqual(result, "(1,)")
 
+    def test_autocommit_param(self):
+        # Ensure that the autocommit connection parameter works.
 
-    def test_autocommit(self):
-        self.assertEqual(self.cnxn.autocommit, False)
+        self.cursor.execute("create table t1(a int)")
+        self.cursor.commit()  # so both cnxns see the table
+
+        # Ensure autocommit defaults to off and that inserting without a commit does not commit
+        # the transaction.
+
+        othercnxn = pyodbc.connect(self.connection_string)
+        self.assertEqual(othercnxn.autocommit, False)
+        othercursor = othercnxn.cursor()
+        othercursor.execute("insert into t1 values (1)")
+        othercursor.close()
+        othercnxn.close()
+
+        count = self.cursor.execute("select count(*) from t1").fetchval()
+        self.assertEqual(count, 0)
+
+        # Test again with autocommit set to true.
+
         othercnxn = pyodbc.connect(self.connection_string, autocommit=True)
         self.assertEqual(othercnxn.autocommit, True)
-        othercnxn.autocommit = False
+        othercursor = othercnxn.cursor()
+        othercursor.execute("insert into t1 values (1)")
+        othercursor.close()
+        othercnxn.close()
+
+        count = self.cursor.execute("select count(*) from t1").fetchval()
+        self.assertEqual(count, 1)
+
+    def test_autocommit_property(self):
+        # Ensure that the autocommit connection property works.
+
+        self.cursor.execute("create table t1(a int)")
+        self.cursor.commit()  # so both cnxns see the table
+
+        # The property will default to False.  Verify and then switch it to true.  Make sure it
+        # actually autocommits.
+
+        othercnxn = pyodbc.connect(self.connection_string)
         self.assertEqual(othercnxn.autocommit, False)
+
+        othercnxn.autocommit = True
+        self.assertEqual(othercnxn.autocommit, True)
+
+        othercnxn = pyodbc.connect(self.connection_string, autocommit=True)
+        self.assertEqual(othercnxn.autocommit, True)
+        othercursor = othercnxn.cursor()
+        othercursor.execute("insert into t1 values (1)")
+        othercursor.close()
+        othercnxn.close()
 
     def test_exc_integrity(self):
         "Make sure an IntegretyError is raised"
