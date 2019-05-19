@@ -56,7 +56,7 @@ def _generate_test_string(length):
     if length <= len(_TESTSTR):
         return _TESTSTR[:length]
 
-    c = (length + len(_TESTSTR)-1) / len(_TESTSTR)
+    c = (length + len(_TESTSTR)-1) // len(_TESTSTR)
     v = _TESTSTR * c
     return v[:length]
 
@@ -66,9 +66,8 @@ class AccessTestCase(unittest.TestCase):
     SMALL_FENCEPOST_SIZES = [ 0, 1, 254, 255 ] # text fields <= 255
     LARGE_FENCEPOST_SIZES = [ 256, 270, 304, 508, 510, 511, 512, 1023, 1024, 2047, 2048, 4000, 4095, 4096, 4097, 10 * 1024, 20 * 1024 ]
 
-    ANSI_FENCEPOSTS    = [ _generate_test_string(size) for size in SMALL_FENCEPOST_SIZES ]
-    UNICODE_FENCEPOSTS = [ unicode(s) for s in ANSI_FENCEPOSTS ]
-    IMAGE_FENCEPOSTS   = ANSI_FENCEPOSTS + [ _generate_test_string(size) for size in LARGE_FENCEPOST_SIZES ]
+    CHAR_FENCEPOSTS    = [ _generate_test_string(size) for size in SMALL_FENCEPOST_SIZES ]
+    IMAGE_FENCEPOSTS   = CHAR_FENCEPOSTS + [ _generate_test_string(size) for size in LARGE_FENCEPOST_SIZES ]
 
     def __init__(self, method_name):
         unittest.TestCase.__init__(self, method_name)
@@ -111,25 +110,29 @@ class AccessTestCase(unittest.TestCase):
         self.cursor.execute("insert into t1 values (?)", 1)
         self.cursor.execute("insert into t2 values (?)", datetime.now())
 
+    def test_drivers(self):
+        p = pyodbc.drivers()
+        self.assertTrue(isinstance(p, list))
+
     def test_datasources(self):
         p = pyodbc.dataSources()
-        self.assert_(isinstance(p, dict))
+        self.assertTrue(isinstance(p, dict))
 
     def test_getinfo_string(self):
         value = self.cnxn.getinfo(pyodbc.SQL_CATALOG_NAME_SEPARATOR)
-        self.assert_(isinstance(value, str))
+        self.assertTrue(isinstance(value, str))
 
     def test_getinfo_bool(self):
         value = self.cnxn.getinfo(pyodbc.SQL_ACCESSIBLE_TABLES)
-        self.assert_(isinstance(value, bool))
+        self.assertTrue(isinstance(value, bool))
 
     def test_getinfo_int(self):
         value = self.cnxn.getinfo(pyodbc.SQL_DEFAULT_TXN_ISOLATION)
-        self.assert_(isinstance(value, (int, long)))
+        self.assertTrue(isinstance(value, int))
 
     def test_getinfo_smallint(self):
         value = self.cnxn.getinfo(pyodbc.SQL_CONCAT_NULL_BEHAVIOR)
-        self.assert_(isinstance(value, int))
+        self.assertTrue(isinstance(value, int))
 
     def _test_strtype(self, sqltype, value, colsize=None):
         """
@@ -146,11 +149,6 @@ class AccessTestCase(unittest.TestCase):
         self.cursor.execute("insert into t1 values(1, ?, ?)", (value, value))
         row = self.cursor.execute("select s1, s2 from t1").fetchone()
 
-        # Access only uses Unicode, but strings might have been passed in to see if they can be written.  When we read
-        # them back, they'll be unicode, so compare our results to a Unicode version of `value`.
-        if type(value) is str:
-            value = unicode(value)
-
         for i in range(2):
             v = row[i]
 
@@ -161,66 +159,52 @@ class AccessTestCase(unittest.TestCase):
 
             self.assertEqual(v, value)
 
-    #
-    # unicode
-    #
 
-    def test_unicode_null(self):
+    def test_varchar_null(self):
         self._test_strtype('varchar', None, 255)
 
     # Generate a test for each fencepost size: test_varchar_0, etc.
     def _maketest(value):
         def t(self):
             self._test_strtype('varchar', value, len(value))
-        t.__doc__ = 'unicode %s' % len(value)
+        t.__doc__ = 'varchar %s' % len(value)
         return t
-    for value in UNICODE_FENCEPOSTS:
-        locals()['test_unicode_%s' % len(value)] = _maketest(value)
-
-    #
-    # ansi -> varchar
-    #
-
-    # Access only stores Unicode text but it should accept ASCII text.
-
-    # Generate a test for each fencepost size: test_varchar_0, etc.
-    def _maketest(value):
-        def t(self):
-            self._test_strtype('varchar', value, len(value))
-        t.__doc__ = 'ansi %s' % len(value)
-        return t
-    for value in ANSI_FENCEPOSTS:
-        locals()['test_ansivarchar_%s' % len(value)] = _maketest(value)
+    for value in CHAR_FENCEPOSTS:
+        locals()['test_varchar_%s' % len(value)] = _maketest(value)
 
     #
     # binary
     #
 
+    def test_null_binary(self):
+        self._test_strtype('binary', None)
+
     # Generate a test for each fencepost size: test_varchar_0, etc.
     def _maketest(value):
         def t(self):
-            self._test_strtype('varbinary', buffer(value), len(value))
+            # Convert to UTF-8 to create a byte array
+            self._test_strtype('varbinary', value.encode('utf-8'), len(value))
         t.__doc__ = 'binary %s' % len(value)
         return t
-    for value in ANSI_FENCEPOSTS:
+    for value in CHAR_FENCEPOSTS:
         locals()['test_binary_%s' % len(value)] = _maketest(value)
 
 
-    #
-    # image
-    #
+    # #
+    # # image
+    # #
 
-    def test_null_image(self):
-        self._test_strtype('image', None)
+    # def test_null_image(self):
+    #     self._test_strtype('image', None)
 
-    # Generate a test for each fencepost size: test_varchar_0, etc.
-    def _maketest(value):
-        def t(self):
-            self._test_strtype('image', buffer(value))
-        t.__doc__ = 'image %s' % len(value)
-        return t
-    for value in IMAGE_FENCEPOSTS:
-        locals()['test_image_%s' % len(value)] = _maketest(value)
+    # # Generate a test for each fencepost size: test_varchar_0, etc.
+    # def _maketest(value):
+    #     def t(self):
+    #         self._test_strtype('image', value.encode('utf-8'))
+    #     t.__doc__ = 'image %s' % len(value)
+    #     return t
+    # for value in IMAGE_FENCEPOSTS:
+    #     locals()['test_image_%s' % len(value)] = _maketest(value)
 
     #
     # memo
@@ -232,20 +216,11 @@ class AccessTestCase(unittest.TestCase):
     # Generate a test for each fencepost size: test_varchar_0, etc.
     def _maketest(value):
         def t(self):
-            self._test_strtype('memo', unicode(value))
+            self._test_strtype('memo', value)
         t.__doc__ = 'Unicode to memo %s' % len(value)
         return t
     for value in IMAGE_FENCEPOSTS:
         locals()['test_memo_%s' % len(value)] = _maketest(value)
-
-    # ansi -> memo
-    def _maketest(value):
-        def t(self):
-            self._test_strtype('memo', value)
-        t.__doc__ = 'ANSI to memo %s' % len(value)
-        return t
-    for value in IMAGE_FENCEPOSTS:
-        locals()['test_ansimemo_%s' % len(value)] = _maketest(value)
 
     def test_subquery_params(self):
         """Ensure parameter markers work in a subquery"""
@@ -288,11 +263,11 @@ class AccessTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(s varchar(20))")
         self.cursor.execute("insert into t1 values(?)", "1")
         row = self.cursor.execute("select * from t1").fetchone()
-        self.assertEquals(row[0], "1")
-        self.assertEquals(row[-1], "1")
+        self.assertEqual(row[0], "1")
+        self.assertEqual(row[-1], "1")
 
     def test_version(self):
-        self.assertEquals(3, len(pyodbc.version.split('.'))) # 1.3.1 etc.
+        self.assertEqual(3, len(pyodbc.version.split('.'))) # 1.3.1 etc.
 
     #
     # date, time, datetime
@@ -305,7 +280,7 @@ class AccessTestCase(unittest.TestCase):
         self.cursor.execute("insert into t1 values (?)", value)
 
         result = self.cursor.execute("select dt from t1").fetchone()[0]
-        self.assertEquals(value, result)
+        self.assertEqual(value, result)
 
     #
     # ints and floats
@@ -316,28 +291,28 @@ class AccessTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(n int)")
         self.cursor.execute("insert into t1 values (?)", value)
         result = self.cursor.execute("select n from t1").fetchone()[0]
-        self.assertEquals(result, value)
+        self.assertEqual(result, value)
 
     def test_negative_int(self):
         value = -1
         self.cursor.execute("create table t1(n int)")
         self.cursor.execute("insert into t1 values (?)", value)
         result = self.cursor.execute("select n from t1").fetchone()[0]
-        self.assertEquals(result, value)
+        self.assertEqual(result, value)
 
     def test_smallint(self):
         value = 32767
         self.cursor.execute("create table t1(n smallint)")
         self.cursor.execute("insert into t1 values (?)", value)
         result = self.cursor.execute("select n from t1").fetchone()[0]
-        self.assertEquals(result, value)
+        self.assertEqual(result, value)
 
     def test_real(self):
         value = 1234.5
         self.cursor.execute("create table t1(n real)")
         self.cursor.execute("insert into t1 values (?)", value)
         result = self.cursor.execute("select n from t1").fetchone()[0]
-        self.assertEquals(result, value)
+        self.assertEqual(result, value)
 
     def test_negative_real(self):
         value = -200.5
@@ -351,7 +326,7 @@ class AccessTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(n float)")
         self.cursor.execute("insert into t1 values (?)", value)
         result = self.cursor.execute("select n from t1").fetchone()[0]
-        self.assertEquals(result, value)
+        self.assertEqual(result, value)
 
     def test_negative_float(self):
         value = -200.5
@@ -435,13 +410,13 @@ class AccessTestCase(unittest.TestCase):
     #
 
     def test_rowcount_delete(self):
-        self.assertEquals(self.cursor.rowcount, -1)
+        self.assertEqual(self.cursor.rowcount, -1)
         self.cursor.execute("create table t1(i int)")
         count = 4
         for i in range(count):
             self.cursor.execute("insert into t1 values (?)", i)
         self.cursor.execute("delete from t1")
-        self.assertEquals(self.cursor.rowcount, count)
+        self.assertEqual(self.cursor.rowcount, count)
 
     def test_rowcount_nodata(self):
         """
@@ -454,7 +429,7 @@ class AccessTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(i int)")
         # This is a different code path internally.
         self.cursor.execute("delete from t1")
-        self.assertEquals(self.cursor.rowcount, 0)
+        self.assertEqual(self.cursor.rowcount, 0)
 
     def test_rowcount_select(self):
         """
@@ -469,11 +444,11 @@ class AccessTestCase(unittest.TestCase):
         for i in range(count):
             self.cursor.execute("insert into t1 values (?)", i)
         self.cursor.execute("select * from t1")
-        self.assertEquals(self.cursor.rowcount, -1)
+        self.assertEqual(self.cursor.rowcount, -1)
 
         rows = self.cursor.fetchall()
-        self.assertEquals(len(rows), count)
-        self.assertEquals(self.cursor.rowcount, -1)
+        self.assertEqual(len(rows), count)
+        self.assertEqual(self.cursor.rowcount, -1)
 
     def test_rowcount_reset(self):
         "Ensure rowcount is reset to -1"
@@ -482,10 +457,10 @@ class AccessTestCase(unittest.TestCase):
         count = 4
         for i in range(count):
             self.cursor.execute("insert into t1 values (?)", i)
-        self.assertEquals(self.cursor.rowcount, 1)
+        self.assertEqual(self.cursor.rowcount, 1)
 
         self.cursor.execute("create table t2(i int)")
-        self.assertEquals(self.cursor.rowcount, -1)
+        self.assertEqual(self.cursor.rowcount, -1)
 
     #
     # Misc
@@ -505,7 +480,7 @@ class AccessTestCase(unittest.TestCase):
         names = [ t[0] for t in self.cursor.description ]
         names.sort()
 
-        self.assertEquals(names, [ "abc", "def" ])
+        self.assertEqual(names, [ "abc", "def" ])
 
         # Put it back so other tests don't fail.
         pyodbc.lowercase = False
@@ -520,7 +495,7 @@ class AccessTestCase(unittest.TestCase):
         self.cursor.execute("insert into t1 values(1, 'abc')")
 
         row = self.cursor.execute("select * from t1").fetchone()
-        self.assertEquals(self.cursor.description, row.cursor_description)
+        self.assertEqual(self.cursor.description, row.cursor_description)
         
 
     def test_executemany(self):
@@ -552,7 +527,7 @@ class AccessTestCase(unittest.TestCase):
                    ('error', 'not an int'),
                    (3, 'good') ]
         
-        self.failUnlessRaises(pyodbc.Error, self.cursor.executemany, "insert into t1(a, b) value (?, ?)", params)
+        self.assertRaises(pyodbc.Error, self.cursor.executemany, "insert into t1(a, b) value (?, ?)", params)
 
         
     def test_row_slicing(self):
@@ -562,13 +537,13 @@ class AccessTestCase(unittest.TestCase):
         row = self.cursor.execute("select * from t1").fetchone()
 
         result = row[:]
-        self.failUnless(result is row)
+        self.assertTrue(result is row)
 
         result = row[:-1]
         self.assertEqual(result, (1,2,3))
 
         result = row[0:4]
-        self.failUnless(result is row)
+        self.assertTrue(result is row)
 
 
     def test_row_repr(self):
@@ -613,7 +588,7 @@ class AccessTestCase(unittest.TestCase):
 def main():
     from optparse import OptionParser
     parser = OptionParser(usage=usage)
-    parser.add_option("-v", "--verbose", action="count", help="Increment test verbosity (can be used multiple times)")
+    parser.add_option("-v", "--verbose", default=0, action="count", help="Increment test verbosity (can be used multiple times)")
     parser.add_option("-d", "--debug", action="store_true", default=False, help="Print debugging items")
     parser.add_option("-t", "--test", help="Run only the named test")
 
@@ -625,10 +600,13 @@ def main():
     if args[0].endswith('.accdb'):
         driver = 'Microsoft Access Driver (*.mdb, *.accdb)'
     else:
-        driver = 'Microsoft Access Driver (*.mdb)'
+        driver = 'Microsoft Access Driver (*.mdb, *.accdb)'
+        # driver = 'Microsoft Access Driver (*.mdb)'
 
     global CNXNSTRING
     CNXNSTRING = 'DRIVER={%s};DBQ=%s;ExtendedAnsiSQL=1' % (driver, abspath(args[0]))
+
+    print(CNXNSTRING)
 
     cnxn = pyodbc.connect(CNXNSTRING)
     print_library_info(cnxn)

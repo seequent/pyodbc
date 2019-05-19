@@ -1,4 +1,3 @@
-
 // There is a bunch of information we want from connections which requires calls to SQLGetInfo when we first connect.
 // However, this isn't something we really want to do for every connection, so we cache it by the hash of the
 // connection string.  When we create a new connection, we copy the values into the connection structure.
@@ -6,19 +5,19 @@
 // We hash the connection string since it may contain sensitive information we wouldn't want exposed in a core dump.
 
 #include "pyodbc.h"
+#include "wrapper.h"
+#include "textenc.h"
 #include "cnxninfo.h"
 #include "connection.h"
-#include "wrapper.h"
 
 // Maps from a Python string of the SHA1 hash to a CnxnInfo object.
 //
 static PyObject* map_hash_to_info;
 
-static PyObject* hashlib;       // The hashlib module if Python 2.5+
-static PyObject* sha;           // The sha module if Python 2.4
+static PyObject* hashlib;       // The hashlib module
 static PyObject* update;        // The string 'update', used in GetHash.
 
-void CnxnInfo_init()
+bool CnxnInfo_init()
 {
     // Called during startup to give us a chance to import the hash code.  If we can't find it, we'll print a warning
     // to the console and not cache anything.
@@ -29,12 +28,15 @@ void CnxnInfo_init()
     map_hash_to_info = PyDict_New();
 
     update = PyString_FromString("update");
+    if (!map_hash_to_info || !update)
+        return false;
 
     hashlib = PyImport_ImportModule("hashlib");
+
     if (!hashlib)
-    {
-        sha = PyImport_ImportModule("sha");
-    }
+        return false;
+
+    return true;
 }
 
 static PyObject* GetHash(PyObject* p)
@@ -44,31 +46,50 @@ static PyObject* GetHash(PyObject* p)
     if (!bytes)
         return 0;
     p = bytes.Get();
+#else
+    Object bytes(PyUnicode_Check(p) ? PyUnicode_EncodeUTF8(PyUnicode_AS_UNICODE(p), PyUnicode_GET_SIZE(p), 0) : 0);
+    if (PyUnicode_Check(p))
+    {
+        if (!bytes)
+            return 0;
+        p = bytes.Get();
+    }
 #endif
 
-    if (hashlib)
-    {
-        Object hash(PyObject_CallMethod(hashlib, "new", "s", "sha1"));
-        if (!hash.IsValid())
-            return 0;
+    Object hash(PyObject_CallMethod(hashlib, "new", "s", "sha1"));
+    if (!hash.IsValid())
+        return 0;
 
-        PyObject_CallMethodObjArgs(hash, update, p, 0);
-        return PyObject_CallMethod(hash, "hexdigest", 0);
-    }
+    Object result(PyObject_CallMethodObjArgs(hash, update, p, 0));
+    if (!result.IsValid())
+        return 0;
 
-    if (sha)
-    {
-        Object hash(PyObject_CallMethod(sha, "new", 0));
-        if (!hash.IsValid())
-            return 0;
-
-        PyObject_CallMethodObjArgs(hash, update, p, 0);
-        return PyObject_CallMethod(hash, "hexdigest", 0);
-    }
-
-    return 0;
+    return PyObject_CallMethod(hash, "hexdigest", 0);
 }
 
+inline void GetColumnSize(Connection* cnxn, SQLSMALLINT sqltype, int* psize)
+{
+    // For some reason I can't seem to reuse the HSTMT multiple times in a row here.  Until I
+    // figure it out I'll simply allocate a new one each time.
+    HSTMT hstmt;
+    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, cnxn->hdbc, &hstmt)))
+        return;
+
+    SQLINTEGER columnsize;
+
+    if (SQL_SUCCEEDED(SQLGetTypeInfo(hstmt, sqltype)) &&
+        SQL_SUCCEEDED(SQLFetch(hstmt)) &&
+        SQL_SUCCEEDED(SQLGetData(hstmt, 3, SQL_INTEGER, &columnsize, sizeof(columnsize), 0)))
+    {
+        // I believe some drivers are returning negative numbers for "unlimited" text fields,
+        // such as FileMaker.  Ignore anything that seems too small.
+        if (columnsize >= 1)
+            *psize = (int)columnsize;
+    }
+
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+}
 
 static PyObject* CnxnInfo_New(Connection* cnxn)
 {
@@ -81,15 +102,20 @@ static PyObject* CnxnInfo_New(Connection* cnxn)
     Object info((PyObject*)p);
 
     // set defaults
-    p->odbc_major             = 3;
-    p->odbc_minor             = 50;
+    p->odbc_major             = 0;
+    p->odbc_minor             = 0;
     p->supports_describeparam = false;
     p->datetime_precision     = 19; // default: "yyyy-mm-dd hh:mm:ss"
     p->need_long_data_len     = false;
 
-    // WARNING: The GIL lock is released for the *entire* function here.  Do not touch any objects, call Python APIs,
-    // etc.  We are simply making ODBC calls and setting atomic values (ints & chars).  Also, make sure the lock gets
-    // released -- do not add an early exit.
+    p->varchar_maxlength  = 1 * 1024 * 1024 * 1024;
+    p->wvarchar_maxlength = 1 * 1024 * 1024 * 1024;
+    p->binary_maxlength   = 1 * 1024 * 1024 * 1024;
+
+    // WARNING: The GIL lock is released for the *entire* function here.  Do not
+    // touch any objects, call Python APIs, etc.  We are simply making ODBC
+    // calls and setting atomic values (ints & chars).  Also, make sure the lock
+    // gets released -- do not add an early exit.
 
     SQLRETURN ret;
     Py_BEGIN_ALLOW_THREADS
@@ -115,37 +141,12 @@ static PyObject* CnxnInfo_New(Connection* cnxn)
     if (SQL_SUCCEEDED(SQLGetInfo(cnxn->hdbc, SQL_NEED_LONG_DATA_LEN, szYN, _countof(szYN), &cch)))
         p->need_long_data_len = (szYN[0] == 'Y');
 
-    // These defaults are tiny, but are necessary for Access.
-    p->varchar_maxlength = 255;
-    p->wvarchar_maxlength = 255;
-    p->binary_maxlength  = 510;
-
-    HSTMT hstmt = 0;
-    if (SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, cnxn->hdbc, &hstmt)))
-    {
-        SQLINTEGER columnsize;
-        if (SQL_SUCCEEDED(SQLGetTypeInfo(hstmt, SQL_TYPE_TIMESTAMP)) && SQL_SUCCEEDED(SQLFetch(hstmt)))
-            if (SQL_SUCCEEDED(SQLGetData(hstmt, 3, SQL_INTEGER, &columnsize, sizeof(columnsize), 0)))
-                p->datetime_precision = (int)columnsize;
-
-        if (SQL_SUCCEEDED(SQLGetTypeInfo(hstmt, SQL_VARCHAR)) && SQL_SUCCEEDED(SQLFetch(hstmt)))
-            if (SQL_SUCCEEDED(SQLGetData(hstmt, 3, SQL_INTEGER, &columnsize, sizeof(columnsize), 0)))
-                p->varchar_maxlength = (int)columnsize;
-
-        if (SQL_SUCCEEDED(SQLGetTypeInfo(hstmt, SQL_WVARCHAR)) && SQL_SUCCEEDED(SQLFetch(hstmt)))
-            if (SQL_SUCCEEDED(SQLGetData(hstmt, 3, SQL_INTEGER, &columnsize, sizeof(columnsize), 0)))
-                p->wvarchar_maxlength = (int)columnsize;
-
-        if (SQL_SUCCEEDED(SQLGetTypeInfo(hstmt, SQL_BINARY)) && SQL_SUCCEEDED(SQLFetch(hstmt)))
-            if (SQL_SUCCEEDED(SQLGetData(hstmt, 3, SQL_INTEGER, &columnsize, sizeof(columnsize), 0)))
-                p->binary_maxlength = (int)columnsize;
-
-        SQLFreeStmt(hstmt, SQL_CLOSE);
-    }
+    GetColumnSize(cnxn, SQL_VARCHAR, &p->varchar_maxlength);
+    GetColumnSize(cnxn, SQL_WVARCHAR, &p->wvarchar_maxlength);
+    GetColumnSize(cnxn, SQL_VARBINARY, &p->binary_maxlength);
+    GetColumnSize(cnxn, SQL_TYPE_TIMESTAMP, &p->datetime_precision);
 
     Py_END_ALLOW_THREADS
-
-    // WARNING: Released the lock now.
 
     return info.Detach();
 }

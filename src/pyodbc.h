@@ -13,9 +13,12 @@
 #define PYODBC_H
 
 #ifdef _MSC_VER
+// The MS headers generate a ton of warnings.
+#pragma warning(push, 0)
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <malloc.h>
+#pragma warning(pop)
 typedef __int64 INT64;
 typedef unsigned __int64 UINT64;
 #else
@@ -24,6 +27,7 @@ typedef unsigned int UINT;
 typedef long long INT64;
 typedef unsigned long long UINT64;
 #define _strcmpi strcasecmp
+#define _strdup strdup
 #ifdef __MINGW32__
   #include <windef.h>
   #include <malloc.h>
@@ -66,6 +70,18 @@ typedef int Py_ssize_t;
 #define _countof(a) (sizeof(a) / sizeof(a[0]))
 #endif
 
+#ifndef SQL_SS_TABLE
+#define SQL_SS_TABLE -153
+#endif
+
+#ifndef SQL_SOPT_SS_PARAM_FOCUS
+#define SQL_SOPT_SS_PARAM_FOCUS 1236
+#endif
+
+#ifndef SQL_CA_SS_TYPE_NAME
+#define SQL_CA_SS_TYPE_NAME 1227
+#endif
+
 inline bool IsSet(DWORD grf, DWORD flags)
 {
     return (grf & flags) == flags;
@@ -105,7 +121,7 @@ inline void _strlwr(char* name)
   #include <crtdbg.h>
   inline void FailAssert(const char* szFile, size_t line, const char* szExpr)
   {
-      printf("assertion failed: %s(%d)\n%s\n", szFile, line, szExpr);
+      printf("assertion failed: %s(%d)\n%s\n", szFile, (int)line, szExpr);
       __debugbreak(); // _CrtDbgBreak();
   }
   #define I(expr) if (!(expr)) FailAssert(__FILE__, __LINE__, #expr);
@@ -122,17 +138,24 @@ inline void DebugTrace(const char* szFmt, ...) { UNUSED(szFmt); }
 #endif
 #define TRACE DebugTrace
 
-#ifdef PYODBC_LEAK_CHECK
-#define pyodbc_malloc(len) _pyodbc_malloc(__FILE__, __LINE__, len)
-void* _pyodbc_malloc(const char* filename, int lineno, size_t len);
-void pyodbc_free(void* p);
-void pyodbc_leak_check();
-#else
+// #ifdef PYODBC_LEAK_CHECK
+// #define pyodbc_malloc(len) _pyodbc_malloc(__FILE__, __LINE__, len)
+// void* _pyodbc_malloc(const char* filename, int lineno, size_t len);
+// void pyodbc_free(void* p);
+// void pyodbc_leak_check();
+// #else
 #define pyodbc_malloc malloc
 #define pyodbc_free free
-#endif
+// #endif
+
+bool pyodbc_realloc(BYTE** pp, size_t newlen);
+// A wrapper around realloc with a safer interface.  If it is successful, *pp is updated to the
+// new pointer value.  If not successful, it is not modified.  (It is easy to forget and lose
+// the old pointer value with realloc.)
 
 void PrintBytes(void* p, size_t len);
+const char* CTypeName(SQLSMALLINT n);
+const char* SqlTypeName(SQLSMALLINT n);
 
 #include "pyodbccompat.h"
 

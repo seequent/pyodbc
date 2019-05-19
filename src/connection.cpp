@@ -1,22 +1,27 @@
-
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 // documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
 // rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
 // permit persons to whom the Software is furnished to do so.
-//  
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
 // WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
 // OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include "pyodbc.h"
+#include "buffer.h"
+#include "wrapper.h"
+#include "textenc.h"
 #include "connection.h"
 #include "cursor.h"
 #include "pyodbcmodule.h"
 #include "errors.h"
-#include "wrapper.h"
 #include "cnxninfo.h"
-#include "sqlwchar.h"
+
+#if PY_MAJOR_VERSION < 3
+static bool IsStringType(PyObject* t) { return (void*)t == (void*)&PyString_Type; }
+static bool IsUnicodeType(PyObject* t) { return (void*)t == (void*)&PyUnicode_Type; }
+#endif
 
 static char connection_doc[] =
     "Connection objects manage connections to the database.\n"
@@ -26,7 +31,7 @@ static char connection_doc[] =
 static Connection* Connection_Validate(PyObject* self)
 {
     Connection* cnxn;
-    
+
     if (self == 0 || !Connection_Check(self))
     {
         PyErr_SetString(PyExc_TypeError, "Connection object required");
@@ -44,18 +49,11 @@ static Connection* Connection_Validate(PyObject* self)
     return cnxn;
 }
 
-static bool Connect(PyObject* pConnectString, HDBC hdbc, bool fAnsi, long timeout)
+static bool Connect(PyObject* pConnectString, HDBC hdbc, bool fAnsi, long timeout,
+                    Object& encoding)
 {
     // This should have been checked by the global connect function.
     I(PyString_Check(pConnectString) || PyUnicode_Check(pConnectString));
-
-    const int cchMax = 600;
-
-    if (PySequence_Length(pConnectString) >= cchMax)
-    {
-        PyErr_SetString(PyExc_TypeError, "connection string too long");
-        return false;
-    }
 
     // The driver manager determines if the app is a Unicode app based on whether we call SQLDriverConnectA or
     // SQLDriverConnectW.  Some drivers, notably Microsoft Access/Jet, change their behavior based on this, so we try
@@ -72,98 +70,220 @@ static bool Connect(PyObject* pConnectString, HDBC hdbc, bool fAnsi, long timeou
     if (timeout > 0)
     {
         Py_BEGIN_ALLOW_THREADS
-        ret = SQLSetConnectAttr(hdbc, SQL_ATTR_LOGIN_TIMEOUT, (SQLPOINTER)timeout, SQL_IS_UINTEGER);
+        ret = SQLSetConnectAttr(hdbc, SQL_ATTR_LOGIN_TIMEOUT, (SQLPOINTER)(uintptr_t)timeout, SQL_IS_UINTEGER);
         Py_END_ALLOW_THREADS
         if (!SQL_SUCCEEDED(ret))
-            RaiseErrorFromHandle("SQLSetConnectAttr(SQL_ATTR_LOGIN_TIMEOUT)", hdbc, SQL_NULL_HANDLE);
+            RaiseErrorFromHandle(0, "SQLSetConnectAttr(SQL_ATTR_LOGIN_TIMEOUT)", hdbc, SQL_NULL_HANDLE);
+    }
+
+    const char* szEncoding = 0;
+    Object encBytes;
+    if (encoding)
+    {
+        #if PY_MAJOR_VERSION < 3
+        if (PyString_Check(encoding))
+        {
+            szEncoding = PyString_AsString(encoding);
+            if (!szEncoding)
+                return false;
+        }
+        #endif
+        if (PyUnicode_Check(encoding))
+        {
+            #if PY_MAJOR_VERSION < 3
+                encBytes = PyUnicode_AsUTF8String(encoding);
+                if (!encBytes)
+                    return false;
+                szEncoding = PyString_AS_STRING(encBytes.Get());
+            #else
+                szEncoding = PyUnicode_AsUTF8(encoding);
+            #endif
+        }
     }
 
     if (!fAnsi)
     {
-        SQLWChar connectString(pConnectString);
+        // I want to call the W version when possible since the driver can use it as an
+        // indication that we can handle Unicode.
+
+        SQLWChar wchar(pConnectString, szEncoding ? szEncoding : ENCSTR_UTF16NE);
+        if (!wchar.isValid())
+            return false;
+
         Py_BEGIN_ALLOW_THREADS
-        ret = SQLDriverConnectW(hdbc, 0, connectString, (SQLSMALLINT)connectString.size(), 0, 0, 0, SQL_DRIVER_NOPROMPT);
+        ret = SQLDriverConnectW(hdbc, 0, wchar.psz, SQL_NTS, 0, 0, 0, SQL_DRIVER_NOPROMPT);
         Py_END_ALLOW_THREADS
         if (SQL_SUCCEEDED(ret))
             return true;
+    }
 
-        // The Unicode function failed.  If the error is that the driver doesn't have a Unicode version (IM001), continue
-        // to the ANSI version.
-        //
-        // I've commented this out since a number of common drivers are returning different errors.  The MySQL 5
-        // driver, for example, returns IM002 "Data source name not found...".
-        //
-        // PyObject* error = GetErrorFromHandle("SQLDriverConnectW", hdbc, SQL_NULL_HANDLE);
-        // if (!HasSqlState(error, "IM001"))
-        // {
-        //     RaiseErrorFromException(error);
-        //     return false;
-        // }
-        // Py_XDECREF(error);
-    }
-        
-    SQLCHAR szConnect[cchMax];
-    if (PyUnicode_Check(pConnectString))
-    {
-        Py_UNICODE* p = PyUnicode_AS_UNICODE(pConnectString);
-        for (Py_ssize_t i = 0, c = PyUnicode_GET_SIZE(pConnectString); i <= c; i++)
-        {
-            if (p[i] > 0xFF)
-            {
-                PyErr_SetString(PyExc_TypeError, "A Unicode connection string was supplied but the driver does "
-                                "not have a Unicode connect function");
-                return false;
-            }
-            szConnect[i] = (SQLCHAR)p[i];
-        }
-    }
-    else
-    {
-#if PY_MAJOR_VERSION < 3
-        const char* p = PyString_AS_STRING(pConnectString);
-        memcpy(szConnect, p, (size_t)(PyString_GET_SIZE(pConnectString) + 1));
-#else
-        PyErr_SetString(PyExc_TypeError, "Connection strings must be Unicode");
+    SQLWChar wchar(pConnectString, szEncoding ? szEncoding : "utf-8");
+    if (!wchar.isValid())
         return false;
-#endif
-    }
 
     Py_BEGIN_ALLOW_THREADS
-    ret = SQLDriverConnect(hdbc, 0, szConnect, SQL_NTS, 0, 0, 0, SQL_DRIVER_NOPROMPT);
+    ret = SQLDriverConnect(hdbc, 0, (SQLCHAR*)wchar.psz, SQL_NTS, 0, 0, 0, SQL_DRIVER_NOPROMPT);
     Py_END_ALLOW_THREADS
     if (SQL_SUCCEEDED(ret))
         return true;
 
-    RaiseErrorFromHandle("SQLDriverConnect", hdbc, SQL_NULL_HANDLE);
+    RaiseErrorFromHandle(0, "SQLDriverConnect", hdbc, SQL_NULL_HANDLE);
 
     return false;
 }
 
+static bool ApplyPreconnAttrs(HDBC hdbc, SQLINTEGER ikey, PyObject *value, char *strencoding)
+{
+    SQLRETURN ret;
+    SQLPOINTER ivalue = 0;
+    SQLINTEGER vallen = 0;
 
-PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, bool fAnsi, bool fUnicodeResults, long timeout, bool fReadOnly)
+    if (PyLong_Check(value))
+    {
+        if (_PyLong_Sign(value) >= 0)
+        {
+            ivalue = (SQLPOINTER)PyLong_AsUnsignedLong(value);
+            vallen = SQL_IS_UINTEGER;
+        } else
+        {
+            ivalue = (SQLPOINTER)PyLong_AsLong(value);
+            vallen = SQL_IS_INTEGER;
+        }
+    }
+#if PY_MAJOR_VERSION < 3
+    else if (PyInt_Check(value))
+    {
+        ivalue = (SQLPOINTER)PyInt_AsLong(value);
+        vallen = SQL_IS_INTEGER;
+    }
+    else if (PyBuffer_Check(value))
+    {
+        // We can only assume and take the first segment.
+        PyBuffer_GetMemory(value, (const char**)&ivalue);
+        vallen = SQL_IS_POINTER;
+    }
+#endif
+#if PY_VERSION_HEX >= 0x02060000
+    else if (PyByteArray_Check(value))
+    {
+        ivalue = (SQLPOINTER)PyByteArray_AsString(value);
+        vallen = SQL_IS_POINTER;
+    }
+#endif
+    else if (PyBytes_Check(value))
+    {
+        ivalue = PyBytes_AS_STRING(value);
+#if PY_MAJOR_VERSION < 3
+        vallen = SQL_NTS;
+#else
+        vallen = SQL_IS_POINTER;
+#endif
+    }
+    else if (PyUnicode_Check(value))
+    {
+        Object stringholder;
+if (sizeof(Py_UNICODE) == 2 // This part should be compile-time.
+    && (!strencoding || !strcmp(strencoding, "utf-16le")))
+{
+        // default or utf-16le is set, pass through directly
+        ivalue = PyUnicode_AS_UNICODE(value);
+}
+else
+{
+        // use strencoding to convert, default to utf-16le if not set.
+        stringholder = PyCodec_Encode(value, strencoding ? strencoding : "utf-16le", "strict");
+        ivalue = PyBytes_AS_STRING(stringholder.Get());
+}
+        vallen = SQL_NTS;
+        Py_BEGIN_ALLOW_THREADS
+        ret = SQLSetConnectAttrW(hdbc, ikey, ivalue, vallen);
+        Py_END_ALLOW_THREADS
+        goto checkSuccess;
+    }
+    else if (PySequence_Check(value))
+    {
+        // To allow for possibility of setting multiple attributes more than once.
+        Py_ssize_t len = PySequence_Size(value);
+        for (Py_ssize_t i = 0; i < len; i++)
+        {
+            Object v(PySequence_GetItem(value, i));
+            if (!ApplyPreconnAttrs(hdbc, ikey, v.Get(), strencoding))
+                return false;
+        }
+        return true;
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    ret = SQLSetConnectAttr(hdbc, ikey, ivalue, vallen);
+    Py_END_ALLOW_THREADS
+
+checkSuccess:
+    if (!SQL_SUCCEEDED(ret))
+    {
+        RaiseErrorFromHandle(0, "SQLSetConnectAttr", hdbc, SQL_NULL_HANDLE);
+        Py_BEGIN_ALLOW_THREADS
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+        Py_END_ALLOW_THREADS
+        return false;
+    }
+    return true;
+}
+
+PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, bool fAnsi, long timeout, bool fReadOnly,
+                         PyObject* attrs_before, Object& encoding)
 {
     // pConnectString
     //   A string or unicode object.  (This must be checked by the caller.)
     //
     // fAnsi
     //   If true, do not attempt a Unicode connection.
-    //
-    // fUnicodeResults
-    //   If true, return strings in rows as unicode objects.
 
     //
     // Allocate HDBC and connect
     //
 
+    Object attrs_before_o(attrs_before);
     HDBC hdbc = SQL_NULL_HANDLE;
     SQLRETURN ret;
     Py_BEGIN_ALLOW_THREADS
     ret = SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
     Py_END_ALLOW_THREADS
     if (!SQL_SUCCEEDED(ret))
-        return RaiseErrorFromHandle("SQLAllocHandle", SQL_NULL_HANDLE, SQL_NULL_HANDLE);
+        return RaiseErrorFromHandle(0, "SQLAllocHandle", SQL_NULL_HANDLE, SQL_NULL_HANDLE);
 
-    if (!Connect(pConnectString, hdbc, fAnsi, timeout))
+    //
+    // Attributes that must be set before connecting.
+    //
+
+    if (attrs_before)
+    {
+        Py_ssize_t pos = 0;
+        PyObject* key = 0;
+        PyObject* value = 0;
+
+        Object encodingholder;
+        char *strencoding = encoding.Get() ?
+            (PyUnicode_Check(encoding) ? PyBytes_AsString(encodingholder = PyCodec_Encode(encoding, "utf-8", "strict")) :
+             PyBytes_Check(encoding) ? PyBytes_AsString(encoding) : 0) : 0;
+
+        while (PyDict_Next(attrs_before, &pos, &key, &value))
+        {
+            SQLINTEGER ikey = 0;
+
+            if (PyLong_Check(key))
+                ikey = (int)PyLong_AsLong(key);
+#if PY_MAJOR_VERSION < 3
+            else if (PyInt_Check(key))
+                ikey = (int)PyInt_AsLong(key);
+#endif
+            if (!ApplyPreconnAttrs(hdbc, ikey, value, strencoding))
+            {
+                return 0;
+            }
+        }
+    }
+
+    if (!Connect(pConnectString, hdbc, fAnsi, timeout, encoding))
     {
         // Connect has already set an exception.
         Py_BEGIN_ALLOW_THREADS
@@ -173,7 +293,7 @@ PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, bool fAnsi,
     }
 
     //
-    // Connected, so allocate the Connection object. 
+    // Connected, so allocate the Connection object.
     //
 
     // Set all variables to something valid, so we don't crash in dealloc if this function fails.
@@ -194,14 +314,61 @@ PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, bool fAnsi,
         return 0;
     }
 
-    cnxn->hdbc            = hdbc;
-    cnxn->nAutoCommit     = fAutoCommit ? SQL_AUTOCOMMIT_ON : SQL_AUTOCOMMIT_OFF;
-    cnxn->searchescape    = 0;
-    cnxn->timeout         = 0;
-    cnxn->unicode_results = fUnicodeResults;
-    cnxn->conv_count      = 0;
-    cnxn->conv_types      = 0;
-    cnxn->conv_funcs      = 0;
+    cnxn->hdbc         = hdbc;
+    cnxn->nAutoCommit  = fAutoCommit ? SQL_AUTOCOMMIT_ON : SQL_AUTOCOMMIT_OFF;
+    cnxn->searchescape = 0;
+    cnxn->maxwrite     = 0;
+    cnxn->timeout      = 0;
+    cnxn->conv_count   = 0;
+    cnxn->conv_types   = 0;
+    cnxn->conv_funcs   = 0;
+
+    cnxn->attrs_before = attrs_before_o.Detach();
+
+    // This is an inefficient default, but should work all the time.  When we are offered
+    // single-byte text we don't actually know what the encoding is.  For example, with SQL
+    // Server the encoding is based on the database's collation.  We ask the driver / DB to
+    // convert to SQL_C_WCHAR and use the ODBC default of UTF-16LE.
+    cnxn->sqlchar_enc.optenc = OPTENC_UTF16NE;
+    cnxn->sqlchar_enc.name   = _strdup(ENCSTR_UTF16NE);
+    cnxn->sqlchar_enc.ctype  = SQL_C_WCHAR;
+
+    cnxn->sqlwchar_enc.optenc = OPTENC_UTF16NE;
+    cnxn->sqlwchar_enc.name   = _strdup(ENCSTR_UTF16NE);
+    cnxn->sqlwchar_enc.ctype  = SQL_C_WCHAR;
+
+    cnxn->metadata_enc.optenc = OPTENC_UTF16NE;
+    cnxn->metadata_enc.name   = _strdup(ENCSTR_UTF16NE);
+    cnxn->metadata_enc.ctype  = SQL_C_WCHAR;
+
+    // Note: I attempted to use UTF-8 here too since it can hold any type, but SQL Server fails
+    // with a data truncation error if we send something encoded in 2 bytes to a column with 1
+    // character.  I don't know if this is a bug in SQL Server's driver or if I'm missing
+    // something, so we'll stay with the default ODBC conversions.
+    cnxn->unicode_enc.optenc = OPTENC_UTF16NE;
+    cnxn->unicode_enc.name   = _strdup(ENCSTR_UTF16NE);
+    cnxn->unicode_enc.ctype  = SQL_C_WCHAR;
+
+#if PY_MAJOR_VERSION < 3
+    cnxn->str_enc.optenc = OPTENC_UTF8;
+    cnxn->str_enc.name   = _strdup("utf-8");
+    cnxn->str_enc.ctype  = SQL_C_CHAR;
+
+    cnxn->sqlchar_enc.to  = TO_UNICODE;
+    cnxn->sqlwchar_enc.to = TO_UNICODE;
+    cnxn->metadata_enc.to = TO_UNICODE;
+#endif
+
+    if (!cnxn->sqlchar_enc.name || !cnxn->sqlwchar_enc.name || !cnxn->metadata_enc.name || !cnxn->unicode_enc.name
+#if PY_MAJOR_VERSION < 3
+        || !cnxn->str_enc.name
+#endif
+        )
+    {
+        PyErr_NoMemory();
+        Py_DECREF(cnxn);
+        return 0;
+    }
 
     //
     // Initialize autocommit mode.
@@ -213,29 +380,27 @@ PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, bool fAnsi,
 
     if (fAutoCommit == false)
     {
-        SQLRETURN ret;
         Py_BEGIN_ALLOW_THREADS
         ret = SQLSetConnectAttr(cnxn->hdbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)cnxn->nAutoCommit, SQL_IS_UINTEGER);
         Py_END_ALLOW_THREADS
 
         if (!SQL_SUCCEEDED(ret))
         {
-            RaiseErrorFromHandle("SQLSetConnnectAttr(SQL_ATTR_AUTOCOMMIT)", cnxn->hdbc, SQL_NULL_HANDLE);
+            RaiseErrorFromHandle(cnxn, "SQLSetConnectAttr(SQL_ATTR_AUTOCOMMIT)", cnxn->hdbc, SQL_NULL_HANDLE);
             Py_DECREF(cnxn);
             return 0;
         }
     }
-    
+
     if (fReadOnly)
     {
-        SQLRETURN ret;
         Py_BEGIN_ALLOW_THREADS
         ret = SQLSetConnectAttr(cnxn->hdbc, SQL_ATTR_ACCESS_MODE, (SQLPOINTER)SQL_MODE_READ_ONLY, 0);
         Py_END_ALLOW_THREADS
 
         if (!SQL_SUCCEEDED(ret))
         {
-            RaiseErrorFromHandle("SQLSetConnnectAttr(SQL_ATTR_ACCESS_MODE)", cnxn->hdbc, SQL_NULL_HANDLE);
+            RaiseErrorFromHandle(cnxn, "SQLSetConnectAttr(SQL_ATTR_ACCESS_MODE)", cnxn->hdbc, SQL_NULL_HANDLE);
             Py_DECREF(cnxn);
             return 0;
         }
@@ -260,10 +425,10 @@ PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, bool fAnsi,
     cnxn->odbc_minor             = p->odbc_minor;
     cnxn->supports_describeparam = p->supports_describeparam;
     cnxn->datetime_precision     = p->datetime_precision;
+    cnxn->need_long_data_len     = p->need_long_data_len;
     cnxn->varchar_maxlength      = p->varchar_maxlength;
     cnxn->wvarchar_maxlength     = p->wvarchar_maxlength;
     cnxn->binary_maxlength       = p->binary_maxlength;
-    cnxn->need_long_data_len     = p->need_long_data_len;
 
     return reinterpret_cast<PyObject*>(cnxn);
 }
@@ -274,7 +439,7 @@ static void _clear_conv(Connection* cnxn)
     {
         pyodbc_free(cnxn->conv_types);
         cnxn->conv_types = 0;
-        
+
         for (int i = 0; i < cnxn->conv_count; i++)
             Py_XDECREF(cnxn->conv_funcs[i]);
         pyodbc_free(cnxn->conv_funcs);
@@ -284,6 +449,34 @@ static void _clear_conv(Connection* cnxn)
     }
 }
 
+static char set_attr_doc[] =
+    "set_attr(attr_id, value) -> None\n\n"
+    "Calls SQLSetConnectAttr with the given values.\n\n"
+    "attr_id\n"
+    "  The attribute id (integer) to set.  These are ODBC or driver constants.\n\n"
+    "value\n"
+    "  An integer value.\n\n"
+    "At this time, only integer values are supported and are always passed as SQLUINTEGER.";
+
+static PyObject* Connection_set_attr(PyObject* self, PyObject* args)
+{
+    int id;
+    int value;
+    if (!PyArg_ParseTuple(args, "ii", &id, &value))
+        return 0;
+
+    Connection* cnxn = (Connection*)self;
+
+    SQLRETURN ret;
+    Py_BEGIN_ALLOW_THREADS
+    ret = SQLSetConnectAttr(cnxn->hdbc, id, (SQLPOINTER)(intptr_t)value, SQL_IS_INTEGER);
+    Py_END_ALLOW_THREADS
+
+    if (!SQL_SUCCEEDED(ret))
+        return RaiseErrorFromHandle(cnxn, "SQLSetConnectAttr", cnxn->hdbc, SQL_NULL_HANDLE);
+    Py_RETURN_NONE;
+}
+
 static char conv_clear_doc[] =
     "clear_output_converters() --> None\n\n"
     "Remove all output converter functions.";
@@ -291,7 +484,7 @@ static char conv_clear_doc[] =
 static PyObject* Connection_conv_clear(PyObject* self, PyObject* args)
 {
     UNUSED(args);
-    
+
     Connection* cnxn = (Connection*)self;
     _clear_conv(cnxn);
     Py_RETURN_NONE;
@@ -306,24 +499,38 @@ static int Connection_clear(PyObject* self)
 
     if (cnxn->hdbc != SQL_NULL_HANDLE)
     {
-        // REVIEW: Release threads? (But make sure you zero out hdbc *first*!
-
         TRACE("cnxn.clear cnxn=%p hdbc=%d\n", cnxn, cnxn->hdbc);
 
+        HDBC hdbc = cnxn->hdbc;
+        cnxn->hdbc = SQL_NULL_HANDLE;
         Py_BEGIN_ALLOW_THREADS
         if (cnxn->nAutoCommit == SQL_AUTOCOMMIT_OFF)
-            SQLEndTran(SQL_HANDLE_DBC, cnxn->hdbc, SQL_ROLLBACK);
+            SQLEndTran(SQL_HANDLE_DBC, hdbc, SQL_ROLLBACK);
 
-        SQLDisconnect(cnxn->hdbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, cnxn->hdbc);
+        SQLDisconnect(hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
         Py_END_ALLOW_THREADS
-        
-        cnxn->hdbc = SQL_NULL_HANDLE;
     }
 
     Py_XDECREF(cnxn->searchescape);
     cnxn->searchescape = 0;
-    
+
+    free((void*)cnxn->sqlchar_enc.name);
+    cnxn->sqlchar_enc.name = 0;
+    free((void*)cnxn->sqlwchar_enc.name);
+    cnxn->sqlwchar_enc.name = 0;
+    free((void*)cnxn->metadata_enc.name);
+    cnxn->metadata_enc.name = 0;
+    free((void*)cnxn->unicode_enc.name);
+    cnxn->unicode_enc.name = 0;
+#if PY_MAJOR_VERSION < 3
+    free((void*)cnxn->str_enc.name);
+    cnxn->str_enc.name = 0;
+#endif
+
+    Py_XDECREF(cnxn->attrs_before);
+    cnxn->attrs_before = 0;
+
     _clear_conv(cnxn);
 
     return 0;
@@ -344,11 +551,11 @@ static char close_doc[] =
     "\n"
     "Note that closing a connection without committing the changes first will cause\n"
     "an implicit rollback to be performed.";
-    
+
 static PyObject* Connection_close(PyObject* self, PyObject* args)
 {
     UNUSED(args);
-    
+
     Connection* cnxn = Connection_Validate(self);
     if (!cnxn)
         return 0;
@@ -361,7 +568,7 @@ static PyObject* Connection_close(PyObject* self, PyObject* args)
 static PyObject* Connection_cursor(PyObject* self, PyObject* args)
 {
     UNUSED(args);
-    
+
     Connection* cnxn = Connection_Validate(self);
     if (!cnxn)
         return 0;
@@ -405,6 +612,35 @@ struct GetInfoType
 };
 
 static const GetInfoType aInfoTypes[] = {
+
+    // SQL_CONVERT_X
+    { SQL_CONVERT_FUNCTIONS, GI_UINTEGER },
+    { SQL_CONVERT_BIGINT, GI_UINTEGER },
+    { SQL_CONVERT_BINARY, GI_UINTEGER },
+    { SQL_CONVERT_BIT, GI_UINTEGER },
+    { SQL_CONVERT_CHAR, GI_UINTEGER },
+    { SQL_CONVERT_DATE, GI_UINTEGER },
+    { SQL_CONVERT_DECIMAL, GI_UINTEGER },
+    { SQL_CONVERT_DOUBLE, GI_UINTEGER },
+    { SQL_CONVERT_FLOAT, GI_UINTEGER },
+    { SQL_CONVERT_INTEGER, GI_UINTEGER },
+    { SQL_CONVERT_LONGVARCHAR, GI_UINTEGER },
+    { SQL_CONVERT_NUMERIC, GI_UINTEGER },
+    { SQL_CONVERT_REAL, GI_UINTEGER },
+    { SQL_CONVERT_SMALLINT, GI_UINTEGER },
+    { SQL_CONVERT_TIME, GI_UINTEGER },
+    { SQL_CONVERT_TIMESTAMP, GI_UINTEGER },
+    { SQL_CONVERT_TINYINT, GI_UINTEGER },
+    { SQL_CONVERT_VARBINARY, GI_UINTEGER },
+    { SQL_CONVERT_VARCHAR, GI_UINTEGER },
+    { SQL_CONVERT_LONGVARBINARY, GI_UINTEGER },
+    { SQL_CONVERT_WCHAR, GI_UINTEGER },
+    { SQL_CONVERT_INTERVAL_DAY_TIME, GI_UINTEGER },
+    { SQL_CONVERT_INTERVAL_YEAR_MONTH, GI_UINTEGER },
+    { SQL_CONVERT_WLONGVARCHAR, GI_UINTEGER },
+    { SQL_CONVERT_WVARCHAR, GI_UINTEGER },
+    { SQL_CONVERT_GUID, GI_UINTEGER },
+
     { SQL_ACCESSIBLE_PROCEDURES, GI_YESNO },
     { SQL_ACCESSIBLE_TABLES, GI_YESNO },
     { SQL_ACTIVE_ENVIRONMENTS, GI_USMALLINT },
@@ -423,8 +659,6 @@ static const GetInfoType aInfoTypes[] = {
     { SQL_COLLATION_SEQ, GI_STRING },
     { SQL_COLUMN_ALIAS, GI_YESNO },
     { SQL_CONCAT_NULL_BEHAVIOR, GI_USMALLINT },
-    { SQL_CONVERT_FUNCTIONS, GI_UINTEGER },
-    { SQL_CONVERT_VARCHAR, GI_UINTEGER },
     { SQL_CORRELATION_NAME, GI_USMALLINT },
     { SQL_CREATE_ASSERTION, GI_UINTEGER },
     { SQL_CREATE_CHARACTER_SET, GI_UINTEGER },
@@ -549,6 +783,7 @@ static const GetInfoType aInfoTypes[] = {
     { SQL_XOPEN_CLI_YEAR, GI_STRING },
 };
 
+
 static PyObject* Connection_getinfo(PyObject* self, PyObject* args)
 {
     Connection* cnxn = Connection_Validate(self);
@@ -567,7 +802,7 @@ static PyObject* Connection_getinfo(PyObject* self, PyObject* args)
     }
 
     if (i == _countof(aInfoTypes))
-        return RaiseErrorV(0, ProgrammingError, "Invalid getinfo value: %d", infotype);
+        return RaiseErrorV(0, ProgrammingError, "Unsupported getinfo value: %d", infotype);
 
     char szBuffer[0x1000];
     SQLSMALLINT cch = 0;
@@ -578,7 +813,7 @@ static PyObject* Connection_getinfo(PyObject* self, PyObject* args)
     Py_END_ALLOW_THREADS
     if (!SQL_SUCCEEDED(ret))
     {
-        RaiseErrorFromHandle("SQLGetInfo", cnxn->hdbc, SQL_NULL_HANDLE);
+        RaiseErrorFromHandle(cnxn, "SQLGetInfo", cnxn->hdbc, SQL_NULL_HANDLE);
         return 0;
     }
 
@@ -590,11 +825,11 @@ static PyObject* Connection_getinfo(PyObject* self, PyObject* args)
         result = (szBuffer[0] == 'Y') ? Py_True : Py_False;
         Py_INCREF(result);
         break;
-            
+
     case GI_STRING:
         result = PyString_FromStringAndSize(szBuffer, (Py_ssize_t)cch);
         break;
-        
+
     case GI_UINTEGER:
     {
         SQLUINTEGER n = *(SQLUINTEGER*)szBuffer; // Does this work on PPC or do we need a union?
@@ -608,7 +843,7 @@ static PyObject* Connection_getinfo(PyObject* self, PyObject* args)
 #endif
         break;
     }
-    
+
     case GI_USMALLINT:
         result = PyInt_FromLong(*(SQLUSMALLINT*)szBuffer);
         break;
@@ -631,7 +866,7 @@ PyObject* Connection_endtrans(Connection* cnxn, SQLSMALLINT type)
 
     if (!SQL_SUCCEEDED(ret))
     {
-        RaiseErrorFromHandle("SQLEndTran", hdbc, SQL_NULL_HANDLE);
+        RaiseErrorFromHandle(cnxn, "SQLEndTran", hdbc, SQL_NULL_HANDLE);
         return 0;
     }
 
@@ -641,11 +876,11 @@ PyObject* Connection_endtrans(Connection* cnxn, SQLSMALLINT type)
 static PyObject* Connection_commit(PyObject* self, PyObject* args)
 {
     UNUSED(args);
-    
+
     Connection* cnxn = Connection_Validate(self);
     if (!cnxn)
         return 0;
-    
+
     TRACE("commit: cnxn=%p hdbc=%d\n", cnxn, cnxn->hdbc);
 
     return Connection_endtrans(cnxn, SQL_COMMIT);
@@ -654,19 +889,19 @@ static PyObject* Connection_commit(PyObject* self, PyObject* args)
 static PyObject* Connection_rollback(PyObject* self, PyObject* args)
 {
     UNUSED(args);
-    
+
     Connection* cnxn = Connection_Validate(self);
     if (!cnxn)
         return 0;
-    
+
     TRACE("rollback: cnxn=%p hdbc=%d\n", cnxn, cnxn->hdbc);
 
     return Connection_endtrans(cnxn, SQL_ROLLBACK);
 }
 
-static char cursor_doc[] = 
+static char cursor_doc[] =
     "Return a new Cursor object using the connection.";
-    
+
 static char execute_doc[] =
     "execute(sql, [params]) --> Cursor\n"
     "\n"
@@ -715,7 +950,7 @@ static int Connection_setautocommit(PyObject* self, PyObject* value, void* closu
         PyErr_SetString(PyExc_TypeError, "Cannot delete the autocommit attribute.");
         return -1;
     }
-    
+
     uintptr_t nAutoCommit = PyObject_IsTrue(value) ? SQL_AUTOCOMMIT_ON : SQL_AUTOCOMMIT_OFF;
     SQLRETURN ret;
     Py_BEGIN_ALLOW_THREADS
@@ -723,7 +958,7 @@ static int Connection_setautocommit(PyObject* self, PyObject* value, void* closu
     Py_END_ALLOW_THREADS
     if (!SQL_SUCCEEDED(ret))
     {
-        RaiseErrorFromHandle("SQLSetConnectAttr", cnxn->hdbc, SQL_NULL_HANDLE);
+        RaiseErrorFromHandle(cnxn, "SQLSetConnectAttr", cnxn->hdbc, SQL_NULL_HANDLE);
         return -1;
     }
 
@@ -736,7 +971,7 @@ static int Connection_setautocommit(PyObject* self, PyObject* value, void* closu
 static PyObject* Connection_getsearchescape(PyObject* self, void* closure)
 {
     UNUSED(closure);
-    
+
     Connection* cnxn = (Connection*)self;
 
     if (!cnxn->searchescape)
@@ -749,13 +984,54 @@ static PyObject* Connection_getsearchescape(PyObject* self, void* closure)
         ret = SQLGetInfo(cnxn->hdbc, SQL_SEARCH_PATTERN_ESCAPE, &sz, _countof(sz), &cch);
         Py_END_ALLOW_THREADS
         if (!SQL_SUCCEEDED(ret))
-            return RaiseErrorFromHandle("SQLGetInfo", cnxn->hdbc, SQL_NULL_HANDLE);
+            return RaiseErrorFromHandle(cnxn, "SQLGetInfo", cnxn->hdbc, SQL_NULL_HANDLE);
 
         cnxn->searchescape = PyString_FromStringAndSize(sz, (Py_ssize_t)cch);
     }
 
     Py_INCREF(cnxn->searchescape);
     return cnxn->searchescape;
+}
+
+static PyObject* Connection_getmaxwrite(PyObject* self, void* closure)
+{
+    UNUSED(closure);
+
+    Connection* cnxn = Connection_Validate(self);
+    if (!cnxn)
+        return 0;
+
+    return PyLong_FromSsize_t(cnxn->maxwrite);
+}
+
+static int Connection_setmaxwrite(PyObject* self, PyObject* value, void* closure)
+{
+    UNUSED(closure);
+
+    Connection* cnxn = Connection_Validate(self);
+    if (!cnxn)
+        return -1;
+
+    if (value == 0)
+    {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete the maxwrite attribute.");
+        return -1;
+    }
+    long maxwrite = PyLong_AsLong(value);
+    if (PyErr_Occurred())
+        return -1;
+
+    Py_ssize_t minval = 255;
+
+    if (maxwrite != 0 && maxwrite < minval)
+    {
+        PyErr_Format(PyExc_ValueError, "Cannot set maxwrite less than %d unless setting to 0.", (int)minval);
+        return -1;
+    }
+
+    cnxn->maxwrite = maxwrite;
+
+    return 0;
 }
 
 
@@ -783,7 +1059,7 @@ static int Connection_settimeout(PyObject* self, PyObject* value, void* closure)
         PyErr_SetString(PyExc_TypeError, "Cannot delete the timeout attribute.");
         return -1;
     }
-    intptr_t timeout = PyInt_AsLong(value);
+    long timeout = PyInt_AsLong(value);
     if (timeout == -1 && PyErr_Occurred())
         return -1;
     if (timeout < 0)
@@ -794,11 +1070,11 @@ static int Connection_settimeout(PyObject* self, PyObject* value, void* closure)
 
     SQLRETURN ret;
     Py_BEGIN_ALLOW_THREADS
-    ret = SQLSetConnectAttr(cnxn->hdbc, SQL_ATTR_CONNECTION_TIMEOUT, (SQLPOINTER)timeout, SQL_IS_UINTEGER);
+    ret = SQLSetConnectAttr(cnxn->hdbc, SQL_ATTR_CONNECTION_TIMEOUT, (SQLPOINTER)(uintptr_t)timeout, SQL_IS_UINTEGER);
     Py_END_ALLOW_THREADS
     if (!SQL_SUCCEEDED(ret))
     {
-        RaiseErrorFromHandle("SQLSetConnectAttr", cnxn->hdbc, SQL_NULL_HANDLE);
+        RaiseErrorFromHandle(cnxn, "SQLSetConnectAttr", cnxn->hdbc, SQL_NULL_HANDLE);
         return -1;
     }
 
@@ -806,6 +1082,54 @@ static int Connection_settimeout(PyObject* self, PyObject* value, void* closure)
 
     return 0;
 }
+
+static bool _remove_converter(PyObject* self, SQLSMALLINT sqltype)
+{
+    Connection* cnxn = (Connection*)self;
+
+    if (!cnxn->conv_count)
+    {
+        // There are no converters, so nothing to remove.
+        return true;
+    }
+
+    int          count = cnxn->conv_count;
+    SQLSMALLINT* types = cnxn->conv_types;
+    PyObject**   funcs = cnxn->conv_funcs;
+
+    int i = 0;
+    for (; i < count; i++)
+        if (types[i] == sqltype)
+            break;
+
+    if (i == count)
+    {
+        // There is no converter for this type, so nothing to remove.
+        return true;
+    }
+
+    Py_DECREF(funcs[i]);
+
+    int move = count - i - 1;  // How many are we moving?
+    if (move > 0)
+    {
+        memcpy(&types[i], &types[i+1], move * sizeof(SQLSMALLINT));
+        memcpy(&funcs[i], &funcs[i+1], move * sizeof(PyObject*));
+    }
+    count--;
+
+    // Note: If the realloc fails, the old array is still around and is 1 element too long but
+    // everything will still work, so we ignore.
+    pyodbc_realloc((BYTE**)&types, count * sizeof(SQLSMALLINT));
+    pyodbc_realloc((BYTE**)&funcs, count * sizeof(PyObject*));
+
+    cnxn->conv_count = count;
+    cnxn->conv_types = types;
+    cnxn->conv_funcs = funcs;
+
+    return true;
+}
+
 
 static bool _add_converter(PyObject* self, SQLSMALLINT sqltype, PyObject* func)
 {
@@ -825,7 +1149,7 @@ static bool _add_converter(PyObject* self, SQLSMALLINT sqltype, PyObject* func)
             }
         }
     }
-    
+
     int          oldcount = cnxn->conv_count;
     SQLSMALLINT* oldtypes = cnxn->conv_types;
     PyObject**   oldfuncs = cnxn->conv_funcs;
@@ -855,7 +1179,7 @@ static bool _add_converter(PyObject* self, SQLSMALLINT sqltype, PyObject* func)
     if (oldcount != 0)
     {
         // copy old items
-        memcpy(&newtypes[1], oldtypes, sizeof(int) * oldcount);
+        memcpy(&newtypes[1], oldtypes, sizeof(SQLSMALLINT) * oldcount);
         memcpy(&newfuncs[1], oldfuncs, sizeof(PyObject*) * oldcount);
 
         pyodbc_free(oldtypes);
@@ -879,8 +1203,15 @@ static char conv_add_doc[] =
     "func\n"
     "  The converter function which will be called with a single parameter, the\n"
     "  value, and should return the converted value.  If the value is NULL, the\n"
-    "  parameter will be None.  Otherwise it will be a Python string.";
-
+    "  parameter will be None.  Otherwise it will be a "
+#if PY_MAJOR_VERSION >= 3
+    "bytes object.\n"
+#else
+    "str object with the raw bytes.\n"
+#endif
+    "\n"
+    "If func is None, any existing converter is removed."
+    ;
 
 static PyObject* Connection_conv_add(PyObject* self, PyObject* args)
 {
@@ -889,11 +1220,343 @@ static PyObject* Connection_conv_add(PyObject* self, PyObject* args)
     if (!PyArg_ParseTuple(args, "iO", &sqltype, &func))
         return 0;
 
-    if (!_add_converter(self, (SQLSMALLINT)sqltype, func))
+    if (func != Py_None)
+    {
+        if (!_add_converter(self, (SQLSMALLINT)sqltype, func))
+            return 0;
+    }
+    else
+    {
+        if (!_remove_converter(self, (SQLSMALLINT)sqltype))
+            return 0;
+    }
+
+    Py_RETURN_NONE;
+}
+
+static char conv_remove_doc[] =
+    "remove_output_converter(sqltype) --> None\n"
+    "\n"
+    "Remove an output converter function that was registered with\n"
+    "add_output_converter.  It is safe to call if no converter is\n"
+    "registered for the type.\n"
+    "\n"
+    "sqltype\n"
+    "  The integer SQL type value being converted, which can be one of the defined\n"
+    "  standard constants (e.g. pyodbc.SQL_VARCHAR) or a database-specific value\n"
+    "  (e.g. -151 for the SQL Server 2008 geometry data type).\n"
+    ;
+
+static PyObject* Connection_conv_remove(PyObject* self, PyObject* args)
+{
+    int sqltype;
+    if (!PyArg_ParseTuple(args, "i", &sqltype))
+        return 0;
+
+    if (!_remove_converter(self, (SQLSMALLINT)sqltype))
         return 0;
 
     Py_RETURN_NONE;
 }
+
+static char conv_get_doc[] =
+    "get_output_converter(sqltype) --> <class 'function'>\n"
+    "\n"
+    "Get the output converter function that was registered with\n"
+    "add_output_converter.  It is safe to call if no converter is\n"
+    "registered for the type (returns None).\n"
+    "\n"
+    "sqltype\n"
+    "  The integer SQL type value being converted, which can be one of the defined\n"
+    "  standard constants (e.g. pyodbc.SQL_VARCHAR) or a database-specific value\n"
+    "  (e.g. -151 for the SQL Server 2008 geometry data type).\n"
+    ;
+
+static PyObject* _get_converter(PyObject* self, SQLSMALLINT sqltype)
+{
+    Connection* cnxn = (Connection*)self;
+
+    if (cnxn->conv_count)
+    {
+        for (int i = 0; i < cnxn->conv_count; i++)
+        {
+            if (cnxn->conv_types[i] == sqltype)
+            {
+                return cnxn->conv_funcs[i];
+            }
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* Connection_conv_get(PyObject* self, PyObject* args)
+{
+    int sqltype;
+    if (!PyArg_ParseTuple(args, "i", &sqltype))
+        return 0;
+
+    return _get_converter(self, (SQLSMALLINT)sqltype);
+}
+
+static void NormalizeCodecName(const char* src, char* dest, size_t cbDest)
+{
+    // Copies the codec name to dest, lowercasing it and replacing underscores with dashes.
+    // (Same as _Py_normalize_encoding which is not public.)  It also wraps the value with
+    // pipes so we can search with it.
+    //
+    // UTF_8 --> |utf-8|
+    //
+    // This is an internal function - it will truncate so you should use a buffer bigger than
+    // anything you expect to search for.
+
+    char* pch = &dest[0];
+    char* pchLast = pch + cbDest - 2; // -2 -> leave room for pipe and null
+
+    *pch++ = '|';
+
+    while (*src && pch < pchLast)
+    {
+        if (isupper(*src))
+        {
+            *pch++ = (char)tolower(*src++);
+        }
+        else if (*src == '_')
+        {
+            *pch++ = '-';
+            src++;
+        }
+        else
+        {
+            *pch++ = *src++;
+        }
+    }
+
+    *pch++ = '|';
+    *pch = '\0';
+}
+
+static bool SetTextEncCommon(TextEnc& enc, const char* encoding, int ctype, bool allow_raw)
+{
+    // Code common to setencoding and setdecoding.
+
+    if (!encoding)
+    {
+        PyErr_Format(PyExc_ValueError, "encoding is required");
+        return false;
+    }
+
+    // Normalize the names so we don't have to worry about case or dashes vs underscores.
+    // We'll lowercase everything and convert underscores to dashes.  The results are then
+    // surrounded with pipes so we can search strings.  (See the `strstr` calls below.)
+    char lower[30];
+    NormalizeCodecName(encoding, lower, sizeof(lower));
+
+#if PY_MAJOR_VERSION < 3
+    if (strcmp(lower, "|raw|") == 0)
+    {
+        if (!allow_raw)
+        {
+            // Give a better error message for 'raw' than "not a registered codec".  It is never
+            // registered.
+            PyErr_Format(PyExc_ValueError, "Raw codec is only allowed for str / SQL_CHAR");
+            return false;
+        }
+    }
+    else if (!PyCodec_KnownEncoding(encoding))
+    {
+        PyErr_Format(PyExc_ValueError, "not a registered codec: '%s'", encoding);
+        return false;
+    }
+#else
+    if (!PyCodec_KnownEncoding(encoding))
+    {
+        PyErr_Format(PyExc_ValueError, "not a registered codec: '%s'", encoding);
+        return false;
+    }
+#endif
+
+    if (ctype != 0 && ctype != SQL_WCHAR && ctype != SQL_CHAR)
+    {
+        PyErr_Format(PyExc_ValueError, "Invalid ctype %d.  Must be SQL_CHAR or SQL_WCHAR", ctype);
+        return false;
+    }
+
+    char* cpy = _strdup(encoding);
+    if (!cpy)
+    {
+        PyErr_NoMemory();
+        return false;
+    }
+
+    free((void*)enc.name);
+    enc.name = cpy;
+
+    if (strstr("|utf-8|utf8|", lower))
+    {
+        enc.optenc = OPTENC_UTF8;
+        enc.ctype  = (SQLSMALLINT)(ctype ? ctype : SQL_C_CHAR);
+    }
+    else if (strstr("|utf-16|utf16|", lower))
+    {
+        enc.optenc = OPTENC_UTF16;
+        enc.ctype  = (SQLSMALLINT)(ctype ? ctype : SQL_C_WCHAR);
+    }
+    else if (strstr("|utf-16-be|utf-16be|utf16be|", lower))
+    {
+        enc.optenc = OPTENC_UTF16BE;
+        enc.ctype  = (SQLSMALLINT)(ctype ? ctype : SQL_C_WCHAR);
+    }
+    else if (strstr("|utf-16-le|utf-16le|utf16le|", lower))
+    {
+        enc.optenc = OPTENC_UTF16LE;
+        enc.ctype  = (SQLSMALLINT)(ctype ? ctype : SQL_C_WCHAR);
+    }
+    else if (strstr("|utf-32|utf32|", lower))
+    {
+        enc.optenc = OPTENC_UTF32;
+        enc.ctype  = (SQLSMALLINT)(ctype ? ctype : SQL_C_WCHAR);
+    }
+    else if (strstr("|utf-32-be|utf-32be|utf32be|", lower))
+    {
+        enc.optenc = OPTENC_UTF32BE;
+        enc.ctype  = (SQLSMALLINT)(ctype ? ctype : SQL_C_WCHAR);
+    }
+    else if (strstr("|utf-32-le|utf-32le|utf32le|", lower))
+    {
+        enc.optenc = OPTENC_UTF32LE;
+        enc.ctype  = (SQLSMALLINT)(ctype ? ctype : SQL_C_WCHAR);
+    }
+    else if (strstr("|latin-1|latin1|iso-8859-1|iso8859-1|", lower))
+    {
+        enc.optenc = OPTENC_LATIN1;
+        enc.ctype  = (SQLSMALLINT)(ctype ? ctype : SQL_C_CHAR);
+    }
+#if PY_MAJOR_VERSION < 3
+    else if (strstr("|raw|", lower))
+    {
+        enc.optenc = OPTENC_RAW;
+        enc.ctype  = SQL_C_CHAR;
+    }
+#endif
+    else
+    {
+        enc.optenc = OPTENC_NONE;
+        enc.ctype  = SQL_C_CHAR;
+    }
+
+    return true;
+}
+
+static PyObject* Connection_setencoding(PyObject* self, PyObject* args, PyObject* kwargs)
+{
+    Connection* cnxn = (Connection*)self;
+
+#if PY_MAJOR_VERSION >= 3
+    // In Python 3 we only support encodings for Unicode text.
+    char* encoding = 0;
+    int ctype = 0;
+    static char *kwlist[] = { "encoding", "ctype", 0 };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|si", kwlist, &encoding, &ctype))
+        return 0;
+    TextEnc& enc = cnxn->unicode_enc;
+    bool allow_raw = false;
+#else
+    // In Python 2, we support encodings for Unicode and strings.
+    PyObject* from_type;
+    char* encoding = 0;
+    int ctype = 0;
+    static char *kwlist[] = { "fromtype", "encoding", "ctype", 0 };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|si", kwlist, &from_type, &encoding, &ctype))
+        return 0;
+
+    if (!IsUnicodeType(from_type) && ! IsStringType(from_type))
+        return PyErr_Format(PyExc_TypeError, "fromtype must be str or unicode");
+
+    TextEnc& enc = IsStringType(from_type) ? cnxn->str_enc : cnxn->unicode_enc;
+    bool allow_raw = IsStringType(from_type);
+#endif
+
+    if (!SetTextEncCommon(enc, encoding, ctype, allow_raw))
+        return 0;
+
+    Py_RETURN_NONE;
+}
+
+static char setdecoding_doc[] =
+#if PY_MAJOR_VERSION >= 3
+    "setdecoding(sqltype, encoding=None, ctype=None) --> None\n"
+#else
+    "setdecoding(sqltype, encoding=None, ctype=None, to=None) --> None\n"
+#endif
+    "\n"
+    "Configures how text of type `ctype` (SQL_CHAR or SQL_WCHAR) is decoded\n"
+    "when read from the database.\n"
+    "\n"
+    "When reading, the database will assign one of the sqltypes to text columns.\n"
+    "pyodbc uses this lookup the decoding information set by this function.\n"
+    "sqltype: pyodbc.SQL_CHAR or pyodbc.SQL_WCHAR\n\n"
+    "encoding: A registered Python encoding such as \"utf-8\".\n\n"
+#if PY_MAJOR_VERSION < 3
+    "to: the desired Python object type - str or unicode"
+#endif
+    "ctype: The C data type should be requested.  Set this to SQL_CHAR for\n"
+    "  single-byte encodings like UTF-8 and to SQL_WCHAR for two-byte encodings\n"
+    "  like UTF-16.";
+
+
+static PyObject* Connection_setdecoding(PyObject* self, PyObject* args, PyObject* kwargs)
+{
+    Connection* cnxn = (Connection*)self;
+
+    int sqltype;
+    char* encoding = 0;
+    int ctype = 0;
+    bool allow_raw = false;
+
+#if PY_MAJOR_VERSION >= 3
+    static char *kwlist[] = {"sqltype", "encoding", "ctype", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "i|si", kwlist, &sqltype, &encoding, &ctype))
+        return 0;
+#else
+    int to = 0;
+    PyObject* toObj = 0;
+    static char *kwlist[] = {"sqltype", "encoding", "ctype", "to", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "i|siO", kwlist, &sqltype, &encoding, &ctype, &toObj))
+        return 0;
+
+    if (toObj)
+    {
+        if (IsUnicodeType(toObj))
+            to = TO_UNICODE;
+        else if (IsStringType(toObj))
+            to = TO_STR;
+        else
+            return PyErr_Format(PyExc_ValueError, "`to` can only be unicode or str");
+    }
+
+    allow_raw = (sqltype == SQL_CHAR && to != TO_UNICODE);
+#endif
+
+    if (sqltype != SQL_WCHAR && sqltype != SQL_CHAR && sqltype != SQL_WMETADATA)
+        return PyErr_Format(PyExc_ValueError, "Invalid sqltype %d.  Must be SQL_CHAR or SQL_WCHAR or SQL_WMETADATA", sqltype);
+
+    TextEnc& enc = (sqltype == SQL_CHAR) ? cnxn->sqlchar_enc :
+        ((sqltype == SQL_WMETADATA) ? cnxn->metadata_enc : cnxn->sqlwchar_enc);
+
+    if (!SetTextEncCommon(enc, encoding, ctype, allow_raw))
+        return 0;
+
+#if PY_MAJOR_VERSION < 3
+    if (!to && enc.optenc == OPTENC_RAW)
+        enc.to = TO_STR;
+    else
+        enc.to = to ? to : TO_UNICODE;
+#endif
+
+    Py_RETURN_NONE;
+}
+
+
 
 static char enter_doc[] = "__enter__() -> self.";
 static PyObject* Connection_enter(PyObject* self, PyObject* args)
@@ -911,17 +1574,21 @@ static PyObject* Connection_exit(PyObject* self, PyObject* args)
     // If an error has occurred, `args` will be a tuple of 3 values.  Otherwise it will be a tuple of 3 `None`s.
     I(PyTuple_Check(args));
 
-    if (cnxn->nAutoCommit == SQL_AUTOCOMMIT_OFF && PyTuple_GetItem(args, 0) == Py_None)
+    if (cnxn->nAutoCommit == SQL_AUTOCOMMIT_OFF)
     {
+        SQLSMALLINT CompletionType = (PyTuple_GetItem(args, 0) == Py_None) ? SQL_COMMIT : SQL_ROLLBACK;
         SQLRETURN ret;
         Py_BEGIN_ALLOW_THREADS
-        ret = SQLEndTran(SQL_HANDLE_DBC, cnxn->hdbc, SQL_COMMIT);
+        ret = SQLEndTran(SQL_HANDLE_DBC, cnxn->hdbc, CompletionType);
         Py_END_ALLOW_THREADS
 
         if (!SQL_SUCCEEDED(ret))
-            return RaiseErrorFromHandle("SQLEndTran(SQL_COMMIT)", cnxn->hdbc, SQL_NULL_HANDLE);
+        {
+            const char* szFunc = (CompletionType == SQL_COMMIT) ? "SQLEndTran(SQL_COMMIT)" : "SQLEndTran(SQL_ROLLBACK)";
+            return RaiseErrorFromHandle(cnxn, szFunc, cnxn->hdbc, SQL_NULL_HANDLE);
+        }
     }
-    
+
     Py_RETURN_NONE;
 }
 
@@ -935,10 +1602,15 @@ static struct PyMethodDef Connection_methods[] =
     { "rollback",                Connection_rollback,        METH_NOARGS,  rollback_doc   },
     { "getinfo",                 Connection_getinfo,         METH_VARARGS, getinfo_doc    },
     { "add_output_converter",    Connection_conv_add,        METH_VARARGS, conv_add_doc   },
+    { "remove_output_converter", Connection_conv_remove,     METH_VARARGS, conv_remove_doc },
+    { "get_output_converter",    Connection_conv_get,        METH_VARARGS, conv_get_doc },
     { "clear_output_converters", Connection_conv_clear,      METH_NOARGS,  conv_clear_doc },
+    { "setdecoding",             (PyCFunction)Connection_setdecoding,     METH_VARARGS|METH_KEYWORDS, setdecoding_doc },
+    { "setencoding",             (PyCFunction)Connection_setencoding,     METH_VARARGS|METH_KEYWORDS, 0 },
+    { "set_attr",                Connection_set_attr,        METH_VARARGS, set_attr_doc   },
     { "__enter__",               Connection_enter,           METH_NOARGS,  enter_doc      },
     { "__exit__",                Connection_exit,            METH_VARARGS, exit_doc       },
-    
+
     { 0, 0, 0, 0 }
 };
 
@@ -950,6 +1622,7 @@ static PyGetSetDef Connection_getseters[] = {
       "Returns True if the connection is in autocommit mode; False otherwise.", 0 },
     { "timeout", Connection_gettimeout, Connection_settimeout,
       "The timeout in seconds, zero means no timeout.", 0 },
+    { "maxwrite", Connection_getmaxwrite, Connection_setmaxwrite, "The maximum bytes to write before using SQLPutData.", 0 },
     { 0 }
 };
 

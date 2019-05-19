@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# -*- coding: utf-8 -*-
 
 # Unit tests for PostgreSQL on Linux (Fedora)
 # This is a stripped down copy of the SQL Server tests.
@@ -33,7 +34,7 @@ class PGTestCase(unittest.TestCase):
 
     # If we are reading a binary, string, or unicode value and do not know how large it is, we'll try reading 2K into a
     # buffer on the stack.  We then copy into a new Python object.
-    SMALL_READ  = 2048
+    SMALL_READ  = 100
 
     # A read guaranteed not to fit in the MAX_STACK_STACK stack buffer, but small enough to be used for varchar (4K max).
     LARGE_READ = 4000
@@ -50,6 +51,15 @@ class PGTestCase(unittest.TestCase):
     def setUp(self):
         self.cnxn   = pyodbc.connect(self.connection_string, ansi=self.ansi)
         self.cursor = self.cnxn.cursor()
+
+        # I've set my test database to use UTF-8 which seems most popular.
+        self.cnxn.setdecoding(pyodbc.SQL_WCHAR, encoding='utf-8')
+        self.cnxn.setencoding(str, encoding='utf-8')
+        self.cnxn.setencoding(unicode, encoding='utf-8')
+
+        # As of psql 9.5.04 SQLGetTypeInfo returns absurdly small sizes leading
+        # to slow writes.  Override them:
+        self.cnxn.maxwrite = 1024 * 1024 * 1024
 
         for i in range(3):
             try:
@@ -69,25 +79,29 @@ class PGTestCase(unittest.TestCase):
             # If we've already closed the cursor or connection, exceptions are thrown.
             pass
 
+    def test_drivers(self):
+        p = pyodbc.drivers()
+        self.assertTrue(isinstance(p, list))
+
     def test_datasources(self):
         p = pyodbc.dataSources()
-        self.assert_(isinstance(p, dict))
+        self.assertTrue(isinstance(p, dict))
 
     def test_getinfo_string(self):
         value = self.cnxn.getinfo(pyodbc.SQL_CATALOG_NAME_SEPARATOR)
-        self.assert_(isinstance(value, str))
+        self.assertTrue(isinstance(value, str))
 
     def test_getinfo_bool(self):
         value = self.cnxn.getinfo(pyodbc.SQL_ACCESSIBLE_TABLES)
-        self.assert_(isinstance(value, bool))
+        self.assertTrue(isinstance(value, bool))
 
     def test_getinfo_int(self):
         value = self.cnxn.getinfo(pyodbc.SQL_DEFAULT_TXN_ISOLATION)
-        self.assert_(isinstance(value, (int, long)))
+        self.assertTrue(isinstance(value, (int, long)))
 
     def test_getinfo_smallint(self):
         value = self.cnxn.getinfo(pyodbc.SQL_CONCAT_NULL_BEHAVIOR)
-        self.assert_(isinstance(value, int))
+        self.assertTrue(isinstance(value, int))
 
 
     def test_negative_float(self):
@@ -98,7 +112,7 @@ class PGTestCase(unittest.TestCase):
         self.assertEqual(value, result)
 
 
-    def _test_strtype(self, sqltype, value, colsize=None):
+    def _test_strtype(self, sqltype, value, colsize=None, resulttype=None):
         """
         The implementation for string, Unicode, and binary tests.
         """
@@ -111,24 +125,31 @@ class PGTestCase(unittest.TestCase):
 
         self.cursor.execute(sql)
         self.cursor.execute("insert into t1 values(?)", value)
-        result = self.cursor.execute("select * from t1").fetchone()[0]
 
-        if self.unicode and value != None:
-            self.assertEqual(type(result), unicode)
-        else:
-            self.assertEqual(type(result), type(value))
+        self.cursor.execute("select * from t1")
+        row = self.cursor.fetchone()
+        result = row[0]
 
-        if value is not None:
-            self.assertEqual(len(result), len(value))
+        if resulttype and type(value) is not resulttype:
+            value = resulttype(value)
 
         self.assertEqual(result, value)
+
+
+    def test_maxwrite(self):
+        # If we write more than `maxwrite` bytes, pyodbc will switch from
+        # binding the data all at once to providing it at execute time with
+        # SQLPutData.  The default maxwrite is 1GB so this is rarely needed in
+        # PostgreSQL but I need to test the functionality somewhere.
+        self.cnxn.maxwrite = 300
+        self._test_strtype('varchar', unicode(_generate_test_string(400), 'utf-8'))
 
     #
     # varchar
     #
 
     def test_empty_varchar(self):
-        self._test_strtype('varchar', '', self.SMALL_READ)
+        self._test_strtype('varchar', u'', self.SMALL_READ)
 
     def test_null_varchar(self):
         self._test_strtype('varchar', None, self.SMALL_READ)
@@ -138,10 +159,10 @@ class PGTestCase(unittest.TestCase):
         self._test_strtype('varchar', None, self.LARGE_READ)
 
     def test_small_varchar(self):
-        self._test_strtype('varchar', self.SMALL_STRING, self.SMALL_READ)
+        self._test_strtype('varchar', unicode(self.SMALL_STRING), self.SMALL_READ)
 
     def test_large_varchar(self):
-        self._test_strtype('varchar', self.LARGE_STRING, self.LARGE_READ)
+        self._test_strtype('varchar', unicode(self.LARGE_STRING), self.LARGE_READ)
 
     def test_varchar_many(self):
         self.cursor.execute("create table t1(c1 varchar(300), c2 varchar(300), c3 varchar(300))")
@@ -157,6 +178,9 @@ class PGTestCase(unittest.TestCase):
         self.assertEqual(v2, row.c2)
         self.assertEqual(v3, row.c3)
 
+    def test_varchar_bytes(self):
+        # Write non-unicode data to a varchar field.
+        self._test_strtype('varchar', self.SMALL_STRING, self.SMALL_READ)
 
 
     def test_small_decimal(self):
@@ -216,28 +240,68 @@ class PGTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(s char(7))")
         self.cursor.execute("insert into t1 values(?)", "testing")
         v = self.cursor.execute("select * from t1").fetchone()[0]
-        self.assertEqual(type(v), self.unicode and unicode or str)
-        self.assertEqual(len(v), len(value)) # If we alloc'd wrong, the test below might work because of an embedded NULL
         self.assertEqual(v, value)
+
+    def test_raw_encoding(self):
+        # Read something that is valid ANSI and make sure it comes through.
+        # The database is actually going to send us UTF-8 so don't use extended
+        # characters.
+        #
+        # REVIEW: Is there a good way to write UTF-8 into the database and read
+        # it out?
+        self.cnxn.setencoding(str, encoding='raw')
+
+        expected = "testing"
+        self.cursor.execute("create table t1(s varchar(20))")
+        self.cursor.execute("insert into t1 values (?)", expected)
+        result = self.cursor.execute("select * from t1").fetchone()[0]
+        self.assertEqual(result, expected)
+
+    def test_raw_decoding(self):
+        # Read something that is valid ANSI and make sure it comes through.
+        # The database is actually going to send us UTF-8 so don't use extended
+        # characters.
+        #
+        # REVIEW: Is there a good way to write UTF-8 into the database and read
+        # it out?
+        self.cnxn.setdecoding(pyodbc.SQL_CHAR, encoding='raw')
+        self._test_strtype('varchar', self.SMALL_STRING)
+
+    def test_setdecoding(self):
+        # Force the result to be a string instead of unicode object.  I'm not
+        # sure how to change the encoding for a single column.  (Though I'm
+        # glad you can't - the communications encoding should not depend on
+        # per-column encoding like MySQL uses.)
+        self.cnxn.setdecoding(pyodbc.SQL_CHAR, encoding='utf8', to=str)
+        self.cnxn.setdecoding(pyodbc.SQL_WCHAR, encoding='utf8', to=str)
+        self._test_strtype('varchar', 'test', self.SMALL_READ)
+
+    def test_unicode_latin(self):
+        value = u"x-\u00C2-y" # A hat : Â
+        self.cursor.execute("create table t1(s varchar(20))")
+        self.cursor.execute("insert into t1 values(?)", value)
+        result = self.cursor.execute("select * from t1").fetchone()[0]
+        self.assertEqual(result, value)
+
 
     def test_negative_row_index(self):
         self.cursor.execute("create table t1(s varchar(20))")
         self.cursor.execute("insert into t1 values(?)", "1")
         row = self.cursor.execute("select * from t1").fetchone()
-        self.assertEquals(row[0], "1")
-        self.assertEquals(row[-1], "1")
+        self.assertEqual(row[0], "1")
+        self.assertEqual(row[-1], "1")
 
     def test_version(self):
-        self.assertEquals(3, len(pyodbc.version.split('.'))) # 1.3.1 etc.
+        self.assertEqual(3, len(pyodbc.version.split('.'))) # 1.3.1 etc.
 
     def test_rowcount_delete(self):
-        self.assertEquals(self.cursor.rowcount, -1)
+        self.assertEqual(self.cursor.rowcount, -1)
         self.cursor.execute("create table t1(i int)")
         count = 4
         for i in range(count):
             self.cursor.execute("insert into t1 values (?)", i)
         self.cursor.execute("delete from t1")
-        self.assertEquals(self.cursor.rowcount, count)
+        self.assertEqual(self.cursor.rowcount, count)
 
     def test_rowcount_nodata(self):
         """
@@ -250,7 +314,7 @@ class PGTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(i int)")
         # This is a different code path internally.
         self.cursor.execute("delete from t1")
-        self.assertEquals(self.cursor.rowcount, 0)
+        self.assertEqual(self.cursor.rowcount, 0)
 
     def test_rowcount_select(self):
         self.cursor.execute("create table t1(i int)")
@@ -258,7 +322,7 @@ class PGTestCase(unittest.TestCase):
         for i in range(count):
             self.cursor.execute("insert into t1 values (?)", i)
         self.cursor.execute("select * from t1")
-        self.assertEquals(self.cursor.rowcount, 4)
+        self.assertEqual(self.cursor.rowcount, 4)
 
     # PostgreSQL driver fails here?
     # def test_rowcount_reset(self):
@@ -268,10 +332,10 @@ class PGTestCase(unittest.TestCase):
     #     count = 4
     #     for i in range(count):
     #         self.cursor.execute("insert into t1 values (?)", i)
-    #     self.assertEquals(self.cursor.rowcount, 1)
+    #     self.assertEqual(self.cursor.rowcount, 1)
     #
     #     self.cursor.execute("create table t2(i int)")
-    #     self.assertEquals(self.cursor.rowcount, -1)
+    #     self.assertEqual(self.cursor.rowcount, -1)
 
     def test_lower_case(self):
         "Ensure pyodbc.lowercase forces returned column names to lowercase."
@@ -287,7 +351,7 @@ class PGTestCase(unittest.TestCase):
         names = [ t[0] for t in self.cursor.description ]
         names.sort()
 
-        self.assertEquals(names, [ "abc", "def" ])
+        self.assertEqual(names, [ "abc", "def" ])
 
         # Put it back so other tests don't fail.
         pyodbc.lowercase = False
@@ -302,7 +366,7 @@ class PGTestCase(unittest.TestCase):
         self.cursor.execute("insert into t1 values(1, 'abc')")
 
         row = self.cursor.execute("select * from t1").fetchone()
-        self.assertEquals(self.cursor.description, row.cursor_description)
+        self.assertEqual(self.cursor.description, row.cursor_description)
 
 
     def test_executemany(self):
@@ -337,7 +401,7 @@ class PGTestCase(unittest.TestCase):
                    ('error', 'not an int'),
                    (3, 'good') ]
 
-        self.failUnlessRaises(pyodbc.Error, self.cursor.executemany, "insert into t1(a, b) value (?, ?)", params)
+        self.assertRaises(pyodbc.Error, self.cursor.executemany, "insert into t1(a, b) value (?, ?)", params)
 
 
     def test_executemany_generator(self):
@@ -371,13 +435,13 @@ class PGTestCase(unittest.TestCase):
         row = self.cursor.execute("select * from t1").fetchone()
 
         result = row[:]
-        self.failUnless(result is row)
+        self.assertTrue(result is row)
 
         result = row[:-1]
         self.assertEqual(result, (1,2,3))
 
         result = row[0:4]
-        self.failUnless(result is row)
+        self.assertTrue(result is row)
 
 
     def test_row_repr(self):
@@ -417,6 +481,23 @@ class PGTestCase(unittest.TestCase):
             self.cursor.execute("insert into t1 values(?)", value)
             v = self.cursor.execute("select a from t1").fetchone()[0]
             self.assertEqual(v, value)
+            
+    def test_emoticons(self):
+        # https://github.com/mkleehammer/pyodbc/issues/423
+        #
+        # When sending a varchar parameter, pyodbc is supposed to set ColumnSize to the number
+        # of characters.  Ensure it works even with 4-byte characters.
+        #
+        # http://www.fileformat.info/info/unicode/char/1f31c/index.htm
+
+        v = "x \U0001F31C z"
+
+        self.cursor.execute("create table t1(s varchar(100))")
+        self.cursor.execute("insert into t1 values (?)", v)
+
+        result = self.cursor.execute("select s from t1").fetchone()[0]
+
+        self.assertEqual(result, v)
 
 
 def main():
@@ -444,11 +525,7 @@ def main():
 
     if options.verbose:
         cnxn = pyodbc.connect(connection_string, ansi=options.ansi)
-        print 'library:', os.path.abspath(pyodbc.__file__)
-        print 'odbc:    %s' % cnxn.getinfo(pyodbc.SQL_ODBC_VER)
-        print 'driver:  %s %s' % (cnxn.getinfo(pyodbc.SQL_DRIVER_NAME), cnxn.getinfo(pyodbc.SQL_DRIVER_VER))
-        print 'driver supports ODBC version %s' % cnxn.getinfo(pyodbc.SQL_DRIVER_ODBC_VER)
-        print 'unicode:', pyodbc.UNICODE_SIZE, 'sqlwchar:', pyodbc.SQLWCHAR_SIZE
+        print_library_info(cnxn)
         cnxn.close()
 
     if options.test:

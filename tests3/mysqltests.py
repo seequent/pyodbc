@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 # -*- coding: latin-1 -*-
 
 usage = """\
@@ -12,6 +12,11 @@ a 'test' database, so you can probably use the following.  (Update the driver na
 
 These tests use the pyodbc library from the build directory, not the version installed in your
 Python directories.  You must run `python setup.py build` before running these tests.
+
+You can also put the connection string into a tmp/setup.cfg file like so:
+
+  [mysqltests]
+  connection-string=DRIVER={MySQL};SERVER=localhost;UID=uid;PWD=pwd;DATABASE=db
 """
 
 import sys, os, re
@@ -36,18 +41,20 @@ def _generate_test_string(length):
     if length <= len(_TESTSTR):
         return _TESTSTR[:length]
 
-    c = (length + len(_TESTSTR)-1) / len(_TESTSTR)
+    c = (length + len(_TESTSTR)-1) // len(_TESTSTR)
     v = _TESTSTR * c
     return v[:length]
 
 class MySqlTestCase(unittest.TestCase):
 
+    INTEGERS = [ -1, 0, 1, 0x7FFFFFFF ]
+    BIGINTS  = INTEGERS + [ 0xFFFFFFFF, 0x123456789 ]
+
     SMALL_FENCEPOST_SIZES = [ 0, 1, 255, 256, 510, 511, 512, 1023, 1024, 2047, 2048, 4000 ]
     LARGE_FENCEPOST_SIZES = [ 4095, 4096, 4097, 10 * 1024, 20 * 1024 ]
 
-    ANSI_FENCEPOSTS    = [ _generate_test_string(size) for size in SMALL_FENCEPOST_SIZES ]
-    UNICODE_FENCEPOSTS = [ unicode(s) for s in ANSI_FENCEPOSTS ]
-    BLOB_FENCEPOSTS   = ANSI_FENCEPOSTS + [ _generate_test_string(size) for size in LARGE_FENCEPOST_SIZES ]
+    STR_FENCEPOSTS    = [ _generate_test_string(size) for size in SMALL_FENCEPOST_SIZES ]
+    BLOB_FENCEPOSTS   = STR_FENCEPOSTS + [ _generate_test_string(size) for size in LARGE_FENCEPOST_SIZES ]
 
     def __init__(self, method_name, connection_string):
         unittest.TestCase.__init__(self, method_name)
@@ -56,6 +63,16 @@ class MySqlTestCase(unittest.TestCase):
     def setUp(self):
         self.cnxn   = pyodbc.connect(self.connection_string)
         self.cursor = self.cnxn.cursor()
+
+        # As of libmyodbc5w 5.3 SQLGetTypeInfo returns absurdly small sizes
+        # leading to slow writes.  Override them:
+        self.cnxn.maxwrite = 1024 * 1024 * 1024
+
+        # My MySQL configuration (and I think the default) sends *everything*
+        # in UTF-8.  The pyodbc default is to send Unicode as UTF-16 and to
+        # decode WCHAR via UTF-16.  Change them both to UTF-8.
+        self.cnxn.setdecoding(pyodbc.SQL_WCHAR, encoding='utf-8')
+        self.cnxn.setencoding(encoding='utf-8')
 
         for i in range(3):
             try:
@@ -90,7 +107,7 @@ class MySqlTestCase(unittest.TestCase):
         for i in range(3):
             self.cursor.execute("select n from t1 where n < ?", 10)
             self.cursor.execute("select n from t1 where n < 3")
-        
+
 
     def test_different_bindings(self):
         self.cursor.execute("create table t1(n int)")
@@ -98,29 +115,33 @@ class MySqlTestCase(unittest.TestCase):
         self.cursor.execute("insert into t1 values (?)", 1)
         self.cursor.execute("insert into t2 values (?)", datetime.now())
 
+    def test_drivers(self):
+        p = pyodbc.drivers()
+        self.assertTrue(isinstance(p, list))
+
     def test_datasources(self):
         p = pyodbc.dataSources()
-        self.assert_(isinstance(p, dict))
+        self.assertTrue(isinstance(p, dict))
 
     def test_getinfo_string(self):
         value = self.cnxn.getinfo(pyodbc.SQL_CATALOG_NAME_SEPARATOR)
-        self.assert_(isinstance(value, str))
+        self.assertTrue(isinstance(value, str))
 
     def test_getinfo_bool(self):
         value = self.cnxn.getinfo(pyodbc.SQL_ACCESSIBLE_TABLES)
-        self.assert_(isinstance(value, bool))
+        self.assertTrue(isinstance(value, bool))
 
     def test_getinfo_int(self):
         value = self.cnxn.getinfo(pyodbc.SQL_DEFAULT_TXN_ISOLATION)
-        self.assert_(isinstance(value, (int, long)))
+        self.assertTrue(isinstance(value, int))
 
     def test_getinfo_smallint(self):
         value = self.cnxn.getinfo(pyodbc.SQL_CONCAT_NULL_BEHAVIOR)
-        self.assert_(isinstance(value, int))
+        self.assertTrue(isinstance(value, int))
 
     def _test_strtype(self, sqltype, value, colsize=None):
         """
-        The implementation for string, Unicode, and binary tests.
+        The implementation for string and binary tests.
         """
         assert colsize is None or (value is None or colsize >= len(value))
 
@@ -132,7 +153,7 @@ class MySqlTestCase(unittest.TestCase):
         try:
             self.cursor.execute(sql)
         except:
-            print '>>>>', sql
+            print('>>>>', sql)
         self.cursor.execute("insert into t1 values(?)", value)
         v = self.cursor.execute("select * from t1").fetchone()[0]
 
@@ -158,12 +179,8 @@ class MySqlTestCase(unittest.TestCase):
         def t(self):
             self._test_strtype('varchar', value, max(1, len(value)))
         return t
-    for value in ANSI_FENCEPOSTS:
+    for value in STR_FENCEPOSTS:
         locals()['test_varchar_%s' % len(value)] = _maketest(value)
-
-    # Generate a test using Unicode.
-    for value in UNICODE_FENCEPOSTS:
-        locals()['test_wvarchar_%s' % len(value)] = _maketest(value)
 
     def test_varchar_many(self):
         self.cursor.execute("create table t1(c1 varchar(300), c2 varchar(300), c3 varchar(300))")
@@ -180,7 +197,16 @@ class MySqlTestCase(unittest.TestCase):
         self.assertEqual(v3, row.c3)
 
     def test_varchar_upperlatin(self):
-        self._test_strtype('varchar', 'á', colsize=3)
+        self._test_strtype('varchar', u'á', colsize=3)
+
+    def test_utf16(self):
+        self.cursor.execute("create table t1(c1 varchar(100) character set utf16, c2 varchar(100))")
+        self.cursor.execute("insert into t1 values ('test', 'test')")
+        value = "test"
+        row = self.cursor.execute("select c1,c2 from t1").fetchone()
+        for v in row:
+            self.assertEqual(type(v), str)
+            self.assertEqual(v, value)
 
     #
     # binary
@@ -188,7 +214,7 @@ class MySqlTestCase(unittest.TestCase):
 
     def test_null_binary(self):
         self._test_strtype('varbinary', None, 100)
-     
+
     def test_large_null_binary(self):
         # Bug 1575064
         self._test_strtype('varbinary', None, 4000)
@@ -196,9 +222,9 @@ class MySqlTestCase(unittest.TestCase):
     # Generate a test for each fencepost size: test_binary_0, etc.
     def _maketest(value):
         def t(self):
-            self._test_strtype('varbinary', buffer(value), max(1, len(value)))
+            self._test_strtype('varbinary', bytes(value, 'utf-8'), max(1, len(value)))
         return t
-    for value in ANSI_FENCEPOSTS:
+    for value in STR_FENCEPOSTS:
         locals()['test_binary_%s' % len(value)] = _maketest(value)
 
     #
@@ -211,13 +237,13 @@ class MySqlTestCase(unittest.TestCase):
     # Generate a test for each fencepost size: test_blob_0, etc.
     def _maketest(value):
         def t(self):
-            self._test_strtype('blob', buffer(value))
+            self._test_strtype('blob', bytes(value, 'utf-8'))
         return t
     for value in BLOB_FENCEPOSTS:
         locals()['test_blob_%s' % len(value)] = _maketest(value)
 
     def test_blob_upperlatin(self):
-        self._test_strtype('blob', buffer('á'))
+        self._test_strtype('blob', bytes('á', 'utf-8'))
 
     #
     # text
@@ -231,7 +257,7 @@ class MySqlTestCase(unittest.TestCase):
         def t(self):
             self._test_strtype('text', value)
         return t
-    for value in ANSI_FENCEPOSTS:
+    for value in STR_FENCEPOSTS:
         locals()['test_text_%s' % len(value)] = _maketest(value)
 
     def test_text_upperlatin(self):
@@ -262,21 +288,21 @@ class MySqlTestCase(unittest.TestCase):
     #     v = self.cursor.execute("select b from t1").fetchone()[0]
     #     self.assertEqual(type(v), bool)
     #     self.assertEqual(v, value)
-    #  
+    #
     # def test_bit_string_true(self):
     #     self.cursor.execute("create table t1(b bit)")
     #     self.cursor.execute("insert into t1 values (?)", "xyzzy")
     #     v = self.cursor.execute("select b from t1").fetchone()[0]
     #     self.assertEqual(type(v), bool)
     #     self.assertEqual(v, True)
-    #  
+    #
     # def test_bit_string_false(self):
     #     self.cursor.execute("create table t1(b bit)")
     #     self.cursor.execute("insert into t1 values (?)", "")
     #     v = self.cursor.execute("select b from t1").fetchone()[0]
     #     self.assertEqual(type(v), bool)
     #     self.assertEqual(v, False)
-    
+
     #
     # decimal
     #
@@ -311,6 +337,29 @@ class MySqlTestCase(unittest.TestCase):
         self.assertEqual(type(v), Decimal)
         self.assertEqual(v, value)
 
+    def _test_inttype(self, datatype, n):
+        self.cursor.execute('create table t1(n %s)' % datatype)
+        self.cursor.execute('insert into t1 values (?)', n)
+        result = self.cursor.execute("select n from t1").fetchone()[0]
+        self.assertEqual(result, n)
+
+    def _maketest(datatype, value):
+        def t(self):
+            self._test_inttype(datatype, value)
+        return t
+
+    for value in INTEGERS:
+        name = str(abs(value))
+        if value < 0:
+            name = 'neg_' + name
+        locals()['test_int_%s' % name] = _maketest('int', value)
+
+    for value in BIGINTS:
+        name = str(abs(value))
+        if value < 0:
+            name = 'neg_' + name
+        locals()['test_bigint_%s' % name] = _maketest('bigint', value)
+
     def test_subquery_params(self):
         """Ensure parameter markers work in a subquery"""
         self.cursor.execute("create table t1(id integer, s varchar(20))")
@@ -329,7 +378,7 @@ class MySqlTestCase(unittest.TestCase):
 
     def _exec(self):
         self.cursor.execute(self.sql)
-        
+
     def test_close_cnxn(self):
         """Make sure using a Cursor after closing its connection doesn't crash."""
 
@@ -338,7 +387,7 @@ class MySqlTestCase(unittest.TestCase):
         self.cursor.execute("select * from t1")
 
         self.cnxn.close()
-        
+
         # Now that the connection is closed, we expect an exception.  (If the code attempts to use
         # the HSTMT, we'll get an access violation instead.)
         self.sql = "select * from t1"
@@ -353,19 +402,17 @@ class MySqlTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(s char(7))")
         self.cursor.execute("insert into t1 values(?)", "testing")
         v = self.cursor.execute("select * from t1").fetchone()[0]
-        self.assertEqual(type(v), str)
-        self.assertEqual(len(v), len(value)) # If we alloc'd wrong, the test below might work because of an embedded NULL
         self.assertEqual(v, value)
 
     def test_negative_row_index(self):
         self.cursor.execute("create table t1(s varchar(20))")
         self.cursor.execute("insert into t1 values(?)", "1")
         row = self.cursor.execute("select * from t1").fetchone()
-        self.assertEquals(row[0], "1")
-        self.assertEquals(row[-1], "1")
+        self.assertEqual(row[0], "1")
+        self.assertEqual(row[-1], "1")
 
     def test_version(self):
-        self.assertEquals(3, len(pyodbc.version.split('.'))) # 1.3.1 etc.
+        self.assertEqual(3, len(pyodbc.version.split('.'))) # 1.3.1 etc.
 
     #
     # date, time, datetime
@@ -378,7 +425,7 @@ class MySqlTestCase(unittest.TestCase):
         self.cursor.execute("insert into t1 values (?)", value)
 
         result = self.cursor.execute("select dt from t1").fetchone()[0]
-        self.assertEquals(value, result)
+        self.assertEqual(value, result)
 
     def test_date(self):
         value = date(2001, 1, 1)
@@ -387,8 +434,8 @@ class MySqlTestCase(unittest.TestCase):
         self.cursor.execute("insert into t1 values (?)", value)
 
         result = self.cursor.execute("select dt from t1").fetchone()[0]
-        self.assertEquals(type(result), type(value))
-        self.assertEquals(result, value)
+        self.assertEqual(type(result), type(value))
+        self.assertEqual(result, value)
 
     #
     # ints and floats
@@ -399,14 +446,14 @@ class MySqlTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(n int)")
         self.cursor.execute("insert into t1 values (?)", value)
         result = self.cursor.execute("select n from t1").fetchone()[0]
-        self.assertEquals(result, value)
+        self.assertEqual(result, value)
 
     def test_negative_int(self):
         value = -1
         self.cursor.execute("create table t1(n int)")
         self.cursor.execute("insert into t1 values (?)", value)
         result = self.cursor.execute("select n from t1").fetchone()[0]
-        self.assertEquals(result, value)
+        self.assertEqual(result, value)
 
     def test_bigint(self):
 
@@ -416,7 +463,6 @@ class MySqlTestCase(unittest.TestCase):
         #
         # Top 4 bytes are returned as 0x00 00 00 00.  If the input is high enough, they are returned as 0xFF FF FF FF.
         input = 0x123456789
-        print 'writing %x' % input
         self.cursor.execute("create table t1(d bigint)")
         self.cursor.execute("insert into t1 values (?)", input)
         result = self.cursor.execute("select d from t1").fetchone()[0]
@@ -427,7 +473,7 @@ class MySqlTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(n float)")
         self.cursor.execute("insert into t1 values (?)", value)
         result = self.cursor.execute("select n from t1").fetchone()[0]
-        self.assertEquals(result, value)
+        self.assertEqual(result, value)
 
     def test_negative_float(self):
         value = -200
@@ -439,39 +485,39 @@ class MySqlTestCase(unittest.TestCase):
 
     def test_date(self):
         value = date.today()
-     
+
         self.cursor.execute("create table t1(d date)")
         self.cursor.execute("insert into t1 values (?)", value)
-     
+
         result = self.cursor.execute("select d from t1").fetchone()[0]
-        self.assertEquals(value, result)
+        self.assertEqual(value, result)
 
 
     def test_time(self):
         value = datetime.now().time()
-        
+
         # We aren't yet writing values using the new extended time type so the value written to the database is only
         # down to the second.
         value = value.replace(microsecond=0)
-         
+
         self.cursor.execute("create table t1(t time)")
         self.cursor.execute("insert into t1 values (?)", value)
-         
+
         result = self.cursor.execute("select t from t1").fetchone()[0]
-        self.assertEquals(value, result)
+        self.assertEqual(value, result)
 
     #
     # misc
     #
 
     def test_rowcount_delete(self):
-        self.assertEquals(self.cursor.rowcount, -1)
+        self.assertEqual(self.cursor.rowcount, -1)
         self.cursor.execute("create table t1(i int)")
         count = 4
         for i in range(count):
             self.cursor.execute("insert into t1 values (?)", i)
         self.cursor.execute("delete from t1")
-        self.assertEquals(self.cursor.rowcount, count)
+        self.assertEqual(self.cursor.rowcount, count)
 
     def test_rowcount_nodata(self):
         """
@@ -484,7 +530,7 @@ class MySqlTestCase(unittest.TestCase):
         self.cursor.execute("create table t1(i int)")
         # This is a different code path internally.
         self.cursor.execute("delete from t1")
-        self.assertEquals(self.cursor.rowcount, 0)
+        self.assertEqual(self.cursor.rowcount, 0)
 
     def test_rowcount_select(self):
         """
@@ -498,11 +544,11 @@ class MySqlTestCase(unittest.TestCase):
         for i in range(count):
             self.cursor.execute("insert into t1 values (?)", i)
         self.cursor.execute("select * from t1")
-        self.assertEquals(self.cursor.rowcount, count)
+        self.assertEqual(self.cursor.rowcount, count)
 
         rows = self.cursor.fetchall()
-        self.assertEquals(len(rows), count)
-        self.assertEquals(self.cursor.rowcount, count)
+        self.assertEqual(len(rows), count)
+        self.assertEqual(self.cursor.rowcount, count)
 
     def test_rowcount_reset(self):
         "Ensure rowcount is reset to -1"
@@ -515,10 +561,10 @@ class MySqlTestCase(unittest.TestCase):
         count = 4
         for i in range(count):
             self.cursor.execute("insert into t1 values (?)", i)
-        self.assertEquals(self.cursor.rowcount, 1)
+        self.assertEqual(self.cursor.rowcount, 1)
 
         self.cursor.execute("create table t2(i int)")
-        self.assertEquals(self.cursor.rowcount, 0)
+        self.assertEqual(self.cursor.rowcount, 0)
 
     def test_lower_case(self):
         "Ensure pyodbc.lowercase forces returned column names to lowercase."
@@ -534,11 +580,11 @@ class MySqlTestCase(unittest.TestCase):
         names = [ t[0] for t in self.cursor.description ]
         names.sort()
 
-        self.assertEquals(names, [ "abc", "def" ])
+        self.assertEqual(names, [ "abc", "def" ])
 
         # Put it back so other tests don't fail.
         pyodbc.lowercase = False
-        
+
     def test_row_description(self):
         """
         Ensure Cursor.description is accessible as Row.cursor_description.
@@ -549,13 +595,12 @@ class MySqlTestCase(unittest.TestCase):
         self.cursor.execute("insert into t1 values(1, 'abc')")
 
         row = self.cursor.execute("select * from t1").fetchone()
-        self.assertEquals(self.cursor.description, row.cursor_description)
-        
+        self.assertEqual(self.cursor.description, row.cursor_description)
 
     def test_executemany(self):
         self.cursor.execute("create table t1(a int, b varchar(10))")
 
-        params = [ (i, str(i)) for i in range(1, 6) ]
+        params = [(i, str(i)) for i in range(1, 6)]
 
         self.cursor.executemany("insert into t1(a, b) values (?,?)", params)
 
@@ -570,6 +615,26 @@ class MySqlTestCase(unittest.TestCase):
             self.assertEqual(param[0], row[0])
             self.assertEqual(param[1], row[1])
 
+    def test_fast_executemany(self):
+
+        self.cursor.fast_executemany = True
+
+        self.cursor.execute("create table t1(a int, b varchar(10))")
+
+        params = [(i, str(i)) for i in range(1, 6)]
+
+        self.cursor.executemany("insert into t1(a, b) values (?,?)", params)
+
+        count = self.cursor.execute("select count(*) from t1").fetchone()[0]
+        self.assertEqual(count, len(params))
+
+        self.cursor.execute("select a, b from t1 order by a")
+        rows = self.cursor.fetchall()
+        self.assertEqual(count, len(rows))
+
+        for param, row in zip(params, rows):
+            self.assertEqual(param[0], row[0])
+            self.assertEqual(param[1], row[1])
 
     def test_executemany_one(self):
         "Pass executemany a single sequence"
@@ -589,7 +654,7 @@ class MySqlTestCase(unittest.TestCase):
         for param, row in zip(params, rows):
             self.assertEqual(param[0], row[0])
             self.assertEqual(param[1], row[1])
-        
+
 
     # REVIEW: The following fails.  Research.
 
@@ -598,14 +663,14 @@ class MySqlTestCase(unittest.TestCase):
     #     Ensure that an exception is raised if one query in an executemany fails.
     #     """
     #     self.cursor.execute("create table t1(a int, b varchar(10))")
-    #  
+    #
     #     params = [ (1, 'good'),
     #                ('error', 'not an int'),
     #                (3, 'good') ]
-    #     
-    #     self.failUnlessRaises(pyodbc.Error, self.cursor.executemany, "insert into t1(a, b) value (?, ?)", params)
+    #
+    #     self.assertRaises(pyodbc.Error, self.cursor.executemany, "insert into t1(a, b) value (?, ?)", params)
 
-        
+
     def test_row_slicing(self):
         self.cursor.execute("create table t1(a int, b int, c int, d int)");
         self.cursor.execute("insert into t1 values(1,2,3,4)")
@@ -613,13 +678,13 @@ class MySqlTestCase(unittest.TestCase):
         row = self.cursor.execute("select * from t1").fetchone()
 
         result = row[:]
-        self.failUnless(result is row)
+        self.assertTrue(result is row)
 
         result = row[:-1]
         self.assertEqual(result, (1,2,3))
 
         result = row[0:4]
-        self.failUnless(result is row)
+        self.assertTrue(result is row)
 
 
     def test_row_repr(self):
@@ -647,11 +712,27 @@ class MySqlTestCase(unittest.TestCase):
         othercnxn.autocommit = False
         self.assertEqual(othercnxn.autocommit, False)
 
+    def test_emoticons(self):
+        # https://github.com/mkleehammer/pyodbc/issues/423
+        #
+        # When sending a varchar parameter, pyodbc is supposed to set ColumnSize to the number
+        # of characters.  Ensure it works even with 4-byte characters.
+        #
+        # http://www.fileformat.info/info/unicode/char/1f31c/index.htm
 
+        v = "x \U0001F31C z"
+
+        self.cursor.execute("create table t1(s varchar(100))")
+        self.cursor.execute("insert into t1 values (?)", v)
+
+        result = self.cursor.execute("select s from t1").fetchone()[0]
+
+        self.assertEqual(result, v)
+        
 def main():
     from optparse import OptionParser
     parser = OptionParser(usage=usage)
-    parser.add_option("-v", "--verbose", action="count", help="Increment test verbosity (can be used multiple times)")
+    parser.add_option("-v", "--verbose", action="count", default=0, help="Increment test verbosity (can be used multiple times)")
     parser.add_option("-d", "--debug", action="store_true", default=False, help="Print debugging items")
     parser.add_option("-t", "--test", help="Run only the named test")
 

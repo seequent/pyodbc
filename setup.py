@@ -1,7 +1,7 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
-import sys, os, re, platform
-from os.path import exists, abspath, dirname, join, isdir
+import sys, os, re
+from os.path import exists, abspath, dirname, join, isdir, relpath, expanduser
 
 try:
     # Allow use of setuptools so eggs can be built.
@@ -12,11 +12,18 @@ except ImportError:
 from distutils.extension import Extension
 from distutils.errors import *
 
+if sys.hexversion >= 0x03000000:
+    from configparser import ConfigParser
+else:
+    from ConfigParser import ConfigParser
+
 OFFICIAL_BUILD = 9999
+
 
 def _print(s):
     # Python 2/3 compatibility
     sys.stdout.write(s + '\n')
+
 
 class VersionCommand(Command):
 
@@ -31,9 +38,9 @@ class VersionCommand(Command):
         pass
 
     def run(self):
-        version_str, version = get_version()
+        version_str, _version = get_version()
         sys.stdout.write(version_str + '\n')
-    
+
 
 class TagsCommand(Command):
 
@@ -53,7 +60,7 @@ class TagsCommand(Command):
         files = [ join('src', f) for f in os.listdir('src') if f.endswith(('.h', '.cpp')) ]
         cmd = 'etags %s' % ' '.join(files)
         return os.system(cmd)
-    
+
 
 
 def main():
@@ -62,7 +69,7 @@ def main():
 
     settings = get_compiler_settings(version_str)
 
-    files = [ abspath(join('src', f)) for f in os.listdir('src') if f.endswith('.cpp') ]
+    files = [ relpath(join('src', f)) for f in os.listdir('src') if f.endswith('.cpp') ]
 
     if exists('MANIFEST'):
         os.remove('MANIFEST')
@@ -74,11 +81,11 @@ def main():
 
         'long_description': ('A Python DB API 2 module for ODBC. This project provides an up-to-date, '
                             'convenient interface to ODBC using native data types like datetime and decimal.'),
-        
+
         'maintainer':       "Michael Kleehammer",
         'maintainer_email': "michael@kleehammer.com",
-        
-        'ext_modules': [Extension('pyodbc', files, **settings)],
+
+        'ext_modules': [Extension('pyodbc', sorted(files), **settings)],
 
         'license': 'MIT',
 
@@ -90,16 +97,19 @@ def main():
                        'Operating System :: POSIX',
                        'Programming Language :: Python',
                        'Programming Language :: Python :: 2',
+                       'Programming Language :: Python :: 2.7',
                        'Programming Language :: Python :: 3',
+                       'Programming Language :: Python :: 3.4',
+                       'Programming Language :: Python :: 3.5',
+                       'Programming Language :: Python :: 3.6',
                        'Topic :: Database',
                        ],
 
-        'url': 'http://code.google.com/p/pyodbc',
-        'download_url': 'http://code.google.com/p/pyodbc/downloads/list',
+        'url': 'https://github.com/mkleehammer/pyodbc',
         'cmdclass': { 'version' : VersionCommand,
                      'tags'    : TagsCommand }
         }
-    
+
     if sys.hexversion >= 0x02060000:
         kwargs['options'] = {
             'bdist_wininst': {'user_access_control' : 'auto'}
@@ -110,8 +120,13 @@ def main():
 
 def get_compiler_settings(version_str):
 
-    settings = { 'libraries': [],
-                 'define_macros' : [ ('PYODBC_VERSION', version_str) ] }
+    settings = {
+        'extra_compile_args' : [],
+        'extra_link_args': [],
+        'libraries': [],
+        'include_dirs': [],
+        'define_macros' : [ ('PYODBC_VERSION', version_str) ]
+    }
 
     # This isn't the best or right way to do this, but I don't see how someone is supposed to sanely subclass the build
     # command.
@@ -123,20 +138,26 @@ def get_compiler_settings(version_str):
             pass
 
     if os.name == 'nt':
-        settings['extra_compile_args'] = ['/Wall',
-                                          '/wd4668',
-                                          '/wd4820',
-                                          '/wd4711', # function selected for automatic inline expansion
-                                          '/wd4100', # unreferenced formal parameter
-                                          '/wd4127', # "conditional expression is constant" testing compilation constants
-                                          '/wd4191', # casts to PYCFunction which doesn't have the keywords parameter
-                                          ]
+        settings['extra_compile_args'].extend([
+            '/Wall',
+            '/wd4514',          # unreference inline function removed
+            '/wd4820',          # padding after struct member
+            '/wd4668',          # is not defined as a preprocessor macro
+            '/wd4711', # function selected for automatic inline expansion
+            '/wd4100', # unreferenced formal parameter
+            '/wd4127', # "conditional expression is constant" testing compilation constants
+            '/wd4191', # casts to PYCFunction which doesn't have the keywords parameter
+        ])
+
+        if '--windbg' in sys.argv:
+            # Used only temporarily to add some debugging flags to get better stack traces in
+            # the debugger.  This is not related to building debug versions of Python which use
+            # "--debug".
+            sys.argv.remove('--windbg')
+            settings['extra_compile_args'].extend('/Od /Ge /GS /GZ /RTC1 /Wp64 /Yd'.split())
+
         settings['libraries'].append('odbc32')
         settings['libraries'].append('advapi32')
-
-        if '--debug' in sys.argv:
-            sys.argv.remove('--debug')
-            settings['extra_compile_args'].extend('/Od /Ge /GS /GZ /RTC1 /Wp64 /Yd'.split())
 
     elif os.environ.get("OS", '').lower().startswith('windows'):
         # Windows Cygwin (posix on windows)
@@ -144,53 +165,52 @@ def get_compiler_settings(version_str):
         settings['libraries'].append('odbc32')
 
     elif sys.platform == 'darwin':
-        # OS/X now ships with iODBC.
-        settings['libraries'].append('iodbc')
-
-        # Apple has decided they won't maintain the iODBC system in OS/X and has added deprecation warnings in 10.8.
-        # For now target 10.7 to eliminate the warnings.
+        # The latest versions of OS X no longer ship with iodbc.  Assume
+        # unixODBC for now.
+        settings['libraries'].append('odbc')
 
         # Python functions take a lot of 'char *' that really should be const.  gcc complains about this *a lot*
-        settings['extra_compile_args'] = ['-Wno-write-strings', '-Wno-deprecated-declarations']
+        settings['extra_compile_args'].extend([
+            '-Wno-write-strings',
+            '-Wno-deprecated-declarations'
+        ])
 
-        settings['define_macros'].append( ('MAC_OS_X_VERSION_10_7',) )
+        # Apple has decided they won't maintain the iODBC system in OS/X and has added
+        # deprecation warnings in 10.8.  For now target 10.7 to eliminate the warnings.
+        settings['define_macros'].append(('MAC_OS_X_VERSION_10_7',))
+
+        # Add directories for MacPorts and Homebrew.
+        dirs = ['/usr/local/include', '/opt/local/include', expanduser('~/homebrew/include')]
+        settings['include_dirs'].extend(dir for dir in dirs if isdir(dir))
+
+        # unixODBC make/install places libodbc.dylib in /usr/local/lib/ by default
+        # ( also OS/X since El Capitan prevents /usr/lib from being accessed )
+        settings['library_dirs'] = ['/usr/local/lib']
 
     else:
         # Other posix-like: Linux, Solaris, etc.
 
         # Python functions take a lot of 'char *' that really should be const.  gcc complains about this *a lot*
-        settings['extra_compile_args'] = ['-Wno-write-strings']
+        settings['extra_compile_args'].append('-Wno-write-strings')
+
+        cflags = os.popen('odbc_config --cflags 2>/dev/null').read().strip()
+        if cflags:
+            settings['extra_compile_args'].extend(cflags.split())
+        ldflags = os.popen('odbc_config --libs 2>/dev/null').read().strip()
+        if ldflags:
+            settings['extra_link_args'].extend(ldflags.split())
+
+        from array import array
+        UNICODE_WIDTH = array('u').itemsize
+#        if UNICODE_WIDTH == 4:
+#            # This makes UnixODBC use UCS-4 instead of UCS-2, which works better with sizeof(wchar_t)==4.
+#            # Thanks to Marc-Antoine Parent
+#            settings['define_macros'].append(('SQL_WCHART_CONVERT', '1'))
 
         # What is the proper way to detect iODBC, MyODBC, unixODBC, etc.?
         settings['libraries'].append('odbc')
 
     return settings
-
-
-def add_to_path():
-    """
-    Prepends the build directory to the path so pyodbcconf can be imported without installing it.
-    """
-    # Now run the utility
-  
-    import imp
-    library_exts  = [ t[0] for t in imp.get_suffixes() if t[-1] == imp.C_EXTENSION ]
-    library_names = [ 'pyodbcconf%s' % ext for ext in library_exts ]
-     
-    # Only go into directories that match our version number. 
-     
-    dir_suffix = '-%s.%s' % (sys.version_info[0], sys.version_info[1])
-     
-    build = join(dirname(abspath(__file__)), 'build')
-
-    for top, dirs, files in os.walk(build):
-        dirs = [ d for d in dirs if d.endswith(dir_suffix) ]
-        for name in library_names:
-            if name in files:
-                sys.path.insert(0, top)
-                return
-  
-    raise SystemExit('Did not find pyodbcconf')
 
 
 def get_version():
@@ -202,7 +222,7 @@ def get_version():
       1. If in a git repository, use the latest tag (git describe).
       2. If in an unzipped source directory (from setup.py sdist),
          read the version from the PKG-INFO file.
-      3. Use 3.0.0.0 and complain a lot.
+      3. Use 4.0.0.0 and complain a lot.
     """
     # My goal is to (1) provide accurate tags for official releases but (2) not have to manage tags for every test
     # release.
@@ -230,16 +250,16 @@ def get_version():
         name, numbers = _get_version_git()
 
     if not numbers:
-        _print('WARNING: Unable to determine version.  Using 3.0.0.0')
-        name, numbers = '3.0.0-unsupported', [3,0,0,0]
+        _print('WARNING: Unable to determine version.  Using 4.0.0.0')
+        name, numbers = '4.0.0-unsupported', [4,0,0,0]
 
     return name, numbers
-            
+
 
 def _get_version_pkginfo():
     filename = join(dirname(abspath(__file__)), 'PKG-INFO')
     if exists(filename):
-        re_ver = re.compile(r'^Version: \s+ (\d+)\.(\d+)\.(\d+) (?: -beta(\d+))?', re.VERBOSE)
+        re_ver = re.compile(r'^Version: \s+ (\d+)\.(\d+)\.(\d+) (?: b(\d+))?', re.VERBOSE)
         for line in open(filename):
             match = re_ver.search(line)
             if match:
@@ -252,7 +272,7 @@ def _get_version_pkginfo():
 
 
 def _get_version_git():
-    n, result = getoutput('git describe --tags --match 3.*')
+    n, result = getoutput("git describe --tags --match [0-9]*")
     if n:
         _print('WARNING: git describe failed with: %s %s' % (n, result))
         return None, None
@@ -267,16 +287,17 @@ def _get_version_git():
     if numbers[-1] != OFFICIAL_BUILD:
         # This is a beta of the next micro release, so increment the micro number to reflect this.
         numbers[-2] += 1
-        name = '%s.%s.%s-beta%02d' % tuple(numbers)
+        name = '%s.%s.%sb%d' % tuple(numbers)
 
-    n, result = getoutput('git branch')
-    try:
-        branch = re.search(r'\* (\w+)', result).group(1)
-    except AttributeError:
-        tag = re.search('HEAD detached at (.*)\)', result).group(1)
-        branch = tag
-    if branch != 'master' and not re.match('^v\d+$', branch):
-        name = branch + '-' + name
+    n, result = getoutput('git rev-parse --abbrev-ref HEAD')
+
+    if result == 'HEAD':
+        # We are not on a branch, so use the last revision instead
+        n, result = getoutput('git rev-parse --short HEAD')
+        name = name + '+commit' + result
+    else:
+        if result != 'master' and not re.match('^v\d+$', result):
+            name = name + '+' + result.replace('-', '')
 
     return name, numbers
 

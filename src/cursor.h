@@ -1,10 +1,9 @@
-
 /*
  * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
  * documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
  * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
  * permit persons to whom the Software is furnished to do so.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
  * WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
  * OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
@@ -52,9 +51,22 @@ struct ParamInfo
     // If true, the memory in ParameterValuePtr was allocated via malloc and must be freed.
     bool allocated;
 
-    // The python object containing the parameter value.  A reference to this object should be held until we have
-    // finished using memory owned by it.
-    PyObject* pParam;
+    PyObject* pObject;
+    // An optional object that will be decremented at the end of the execute.
+    // This is useful when the ParameterValuePtr data is in a Python object -
+    // the object can be put here (and INCREFed if necessary!) instead of
+    // copying the data out.
+    //
+    // If SQLPutData is used, this must be set to a bytes or bytearray object!
+
+    SQLLEN maxlength;
+    // If SQLPutData is being used, this must be set to the amount that can be
+    // written to each SQLPutData call.  (It is not clear if they are limited
+    // like SQLBindParameter or not.)
+
+    // For TVPs, the nested descriptors and current row.
+    struct ParamInfo *nested;
+    SQLLEN curTvpRow;
 
     // Optional data.  If used, ParameterValuePtr will point into this.
     union
@@ -82,7 +94,7 @@ struct Cursor
     //
     // SQL Parameters
     //
-    
+
     // If non-zero, a pointer to the previously prepared SQL string, allowing us to skip the prepare and gathering of
     // parameter data.
     PyObject* pPreparedSQL;
@@ -102,6 +114,15 @@ struct Cursor
     // Even if the same SQL statement is executed twice, the parameter bindings are redone from scratch since we try to
     // bind into the Python objects directly.
     ParamInfo* paramInfos;
+
+    // Parameter set array (used with executemany)
+    unsigned char *paramArray;
+    
+    // Whether to use fast executemany with parameter arrays and other optimisations
+    char fastexecmany;
+    
+    // The list of information for setinputsizes().
+    PyObject *inputsizes;
 
     //
     // Result Information
